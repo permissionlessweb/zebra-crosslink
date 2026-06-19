@@ -4,38 +4,38 @@
 //! We want to ensure that users can use this crate to build RPC clients, so
 //! this is an integration test to ensure only the public API is accessed.
 
+#![allow(clippy::unwrap_in_result)]
+
 mod vectors;
 
-use std::{io::Cursor, ops::Deref};
+use std::io::Cursor;
 
 use vectors::{
     GET_BLOCKCHAIN_INFO_RESPONSE, GET_BLOCK_RESPONSE_1, GET_BLOCK_RESPONSE_2,
     GET_BLOCK_TEMPLATE_RESPONSE_TEMPLATE, GET_RAW_TRANSACTION_RESPONSE_TRUE,
 };
 
-use zebra_rpc::client::{
-    zebra_chain::{
-        sapling::NotSmallOrderValueCommitment,
-        serialization::{ZcashDeserialize, ZcashSerialize},
-        subtree::NoteCommitmentSubtreeIndex,
-        transparent::{OutputIndex, Script},
-        work::difficulty::{CompactDifficulty, ExpandedDifficulty},
-    },
-    GetBlockchainInfoBalance, JoinSplit, OrchardFlags,
+use zebra_rpc::client::zebra_chain::{
+    sapling::ValueCommitment,
+    serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashSerialize},
+    subtree::NoteCommitmentSubtreeIndex,
+    transparent::{OutputIndex, Script},
+    work::difficulty::{CompactDifficulty, ExpandedDifficulty},
 };
 use zebra_rpc::client::{
     BlockHeaderObject, BlockObject, BlockTemplateResponse, Commitments, DefaultRoots,
     FundingStream, GetAddressBalanceRequest, GetAddressBalanceResponse, GetAddressTxIdsRequest,
-    GetAddressUtxosResponse, GetBlockHashResponse, GetBlockHeaderResponse,
-    GetBlockHeightAndHashResponse, GetBlockResponse, GetBlockSubsidyResponse,
-    GetBlockTemplateParameters, GetBlockTemplateRequestMode, GetBlockTemplateResponse,
-    GetBlockTransaction, GetBlockTrees, GetBlockchainInfoResponse, GetInfoResponse,
-    GetMiningInfoResponse, GetPeerInfoResponse, GetRawMempoolResponse, GetRawTransactionResponse,
-    GetSubtreesByIndexResponse, GetTreestateResponse, Hash, Input, MempoolObject, Orchard,
-    OrchardAction, Output, PeerInfo, ScriptPubKey, ScriptSig, SendRawTransactionResponse,
-    ShieldedOutput, ShieldedSpend, SubmitBlockErrorResponse, SubmitBlockResponse, SubtreeRpcData,
-    TransactionObject, TransactionTemplate, Treestate, Utxo, ValidateAddressResponse,
-    ZListUnifiedReceiversResponse, ZValidateAddressResponse,
+    GetAddressUtxosResponse, GetAddressUtxosResponseObject, GetBlockHashResponse,
+    GetBlockHeaderResponse, GetBlockHeightAndHashResponse, GetBlockResponse,
+    GetBlockSubsidyResponse, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
+    GetBlockTemplateResponse, GetBlockTransaction, GetBlockTrees, GetBlockchainInfoBalance,
+    GetBlockchainInfoResponse, GetInfoResponse, GetMiningInfoResponse, GetNetworkInfoResponse,
+    GetPeerInfoResponse, GetRawMempoolResponse, GetRawTransactionResponse,
+    GetSubtreesByIndexResponse, GetTreestateResponse, Hash, Input, JoinSplit, MempoolObject,
+    Orchard, OrchardAction, OrchardFlags, Output, ScriptPubKey, ScriptSig,
+    SendRawTransactionResponse, ShieldedOutput, ShieldedSpend, SubmitBlockErrorResponse,
+    SubmitBlockResponse, SubtreeRpcData, TransactionObject, TransactionTemplate, Treestate, Utxo,
+    ValidateAddressResponse, ZListUnifiedReceiversResponse, ZValidateAddressResponse,
 };
 
 #[test]
@@ -53,7 +53,7 @@ fn test_get_info() -> Result<(), Box<dyn std::error::Error>> {
   "paytxfee": 0.0,
   "relayfee": 1e-6,
   "errors": "no errors",
-  "errorstimestamp": "2025-05-20 19:33:53.395307694 UTC"
+  "errorstimestamp": 1762881920
 }"#;
     let obj: GetInfoResponse = serde_json::from_str(json)?;
 
@@ -84,7 +84,7 @@ fn test_get_info() -> Result<(), Box<dyn std::error::Error>> {
         pay_tx_fee,
         relay_fee,
         errors.clone(),
-        errors_timestamp.clone(),
+        errors_timestamp,
     );
 
     assert_eq!(obj, new_obj);
@@ -208,10 +208,10 @@ fn test_get_block_1() -> Result<(), Box<dyn std::error::Error>> {
     let block_commitments = block.block_commitments();
     let final_sapling_root = block.final_sapling_root();
     let final_orchard_root = block.final_orchard_root();
+    let n_tx = block.n_tx();
     let tx = block
         .tx()
         .iter()
-        .cloned()
         .map(|tx| {
             let GetBlockTransaction::Hash(h) = tx else {
                 panic!("Expected GetBlockTransaction::Hash")
@@ -255,6 +255,7 @@ fn test_get_block_1() -> Result<(), Box<dyn std::error::Error>> {
         block_commitments,
         final_sapling_root,
         final_orchard_root,
+        n_tx,
         tx.iter()
             .map(|h| GetBlockTransaction::Hash(zebra_chain::transaction::Hash(*h)))
             .collect(),
@@ -297,6 +298,7 @@ fn test_get_block_2() -> Result<(), Box<dyn std::error::Error>> {
     let block_commitments = block.block_commitments();
     let final_sapling_root = block.final_sapling_root();
     let final_orchard_root = block.final_orchard_root();
+    let n_tx = block.n_tx();
     // We don't unpack the transaction object because we test that in the
     // get_raw_transaction test.
     let tx = block
@@ -331,6 +333,7 @@ fn test_get_block_2() -> Result<(), Box<dyn std::error::Error>> {
         block_commitments,
         final_sapling_root,
         final_orchard_root,
+        n_tx,
         tx.iter()
             .cloned()
             .map(GetBlockTransaction::Object)
@@ -749,8 +752,7 @@ fn test_get_raw_transaction_true() -> Result<(), Box<dyn std::error::Error>> {
             let proof = spend.proof();
             let spend_auth_sig = spend.spend_auth_sig();
             ShieldedSpend::new(
-                NotSmallOrderValueCommitment::zcash_deserialize(Cursor::new(cv))
-                    .expect("was just serialized"),
+                ValueCommitment::zcash_deserialize(Cursor::new(cv)).expect("was just serialized"),
                 anchor,
                 nullifier,
                 rk,
@@ -770,8 +772,7 @@ fn test_get_raw_transaction_true() -> Result<(), Box<dyn std::error::Error>> {
             let out_ciphertext = output.out_ciphertext();
             let proof = output.proof();
             ShieldedOutput::new(
-                NotSmallOrderValueCommitment::zcash_deserialize(Cursor::new(cv))
-                    .expect("was just serialized"),
+                ValueCommitment::zcash_deserialize(Cursor::new(cv)).expect("was just serialized"),
                 cm_u,
                 ephemeral_key,
                 enc_ciphertext,
@@ -890,7 +891,7 @@ fn test_get_address_tx_ids() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_get_address_utxos() -> Result<(), Box<dyn std::error::Error>> {
+fn test_get_address_utxos_chain_info_false() -> Result<(), Box<dyn std::error::Error>> {
     let json = r#"
 [
   {
@@ -905,11 +906,15 @@ fn test_get_address_utxos() -> Result<(), Box<dyn std::error::Error>> {
 "#;
     let obj: GetAddressUtxosResponse = serde_json::from_str(json)?;
 
+    let GetAddressUtxosResponse::Utxos(obj) = &obj else {
+        panic!("Expected ChainInfoFalse variant");
+    };
+
     let new_obj = obj
         .iter()
         .map(|utxo| {
             // Address extractability was checked manually
-            let address = utxo.address().clone();
+            let address = utxo.address();
             // Hash extractability was checked in other test
             let txid = utxo.txid();
             let output_index = utxo.output_index().index();
@@ -920,7 +925,7 @@ fn test_get_address_utxos() -> Result<(), Box<dyn std::error::Error>> {
             let height = utxo.height();
 
             Utxo::new(
-                address,
+                *address,
                 txid,
                 OutputIndex::from_index(output_index),
                 script,
@@ -930,7 +935,68 @@ fn test_get_address_utxos() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(obj, new_obj);
+    assert_eq!(obj.clone(), new_obj);
+
+    Ok(())
+}
+
+#[test]
+fn test_get_address_utxos_chain_info_true() -> Result<(), Box<dyn std::error::Error>> {
+    let json = r#"
+{
+    "utxos": [
+        {
+            "address": "t1at7nVNsv6taLRrNRvnQdtfLNRDfsGc3Ak",
+            "txid": "6ee3e8a86dfeca629aeaf794aacb714db1cf1868bc9fe487de443e6197d8764a",
+            "outputIndex": 0,
+            "script": "76a914ba92ff06081d5ff6542af8d3b2d209d29ba6337c88ac",
+            "satoshis": 125000000,
+            "height": 2931856
+        }
+    ],
+    "hash": "000000000079a1a696c9d2073ec4cd8729d2a59bbb26999263cbaab992e09280",
+    "height": 3053274
+}
+"#;
+    let obj: GetAddressUtxosResponse = serde_json::from_str(json)?;
+
+    let GetAddressUtxosResponse::UtxosAndChainInfo(obj) = &obj else {
+        panic!("Expected ChainInfoTrue variant");
+    };
+
+    let hash = obj.hash();
+    let height = obj.height();
+
+    let new_obj = GetAddressUtxosResponseObject::new(
+        obj.utxos()
+            .iter()
+            .map(|utxo| {
+                // Address extractability was checked manually
+                let address = utxo.address();
+                // Hash extractability was checked in other test
+                let txid = utxo.txid();
+                let output_index = utxo.output_index().index();
+                // Script extractability was checked in other test
+                let script = utxo.script().clone();
+                let satoshis = utxo.satoshis();
+                // Height extractability was checked in other test
+                let height = utxo.height();
+
+                Utxo::new(
+                    *address,
+                    txid,
+                    OutputIndex::from_index(output_index),
+                    script,
+                    satoshis,
+                    height,
+                )
+            })
+            .collect::<Vec<_>>(),
+        hash,
+        height,
+    );
+
+    assert_eq!(obj.clone(), new_obj);
 
     Ok(())
 }
@@ -966,7 +1032,6 @@ fn test_get_block_template_request() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[ignore] // [MUTEX LOCK PROBLEM]
 #[test]
 fn test_get_block_template_response() -> Result<(), Box<dyn std::error::Error>> {
     let json = GET_BLOCK_TEMPLATE_RESPONSE_TEMPLATE;
@@ -1055,7 +1120,6 @@ fn test_get_block_template_response() -> Result<(), Box<dyn std::error::Error>> 
         height,
         max_time,
         submit_old,
-        zebra_chain::block::FatPointerToBftBlock::null(),
     )));
 
     assert_eq!(obj, new_obj);
@@ -1114,31 +1178,151 @@ fn test_get_mining_info() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_get_network_info() -> Result<(), Box<dyn std::error::Error>> {
+    let json = r#"
+{
+  "version": 2030010,
+  "subversion": "/Zebra:2.3.0/",
+  "protocolversion": 170120,
+  "localservices": "0000000000000001",
+  "timeoffset": 0,
+  "connections": 75,
+  "networks": [
+  {
+    "name": "ipv4",
+    "limited": false,
+    "reachable": true,
+    "proxy": "",
+    "proxy_randomize_credentials": false
+  },
+  {
+    "name": "ipv6",
+    "limited": false,
+    "reachable": true,
+    "proxy": "",
+    "proxy_randomize_credentials": false
+  },
+  {
+    "name": "onion",
+    "limited": false,
+    "reachable": false,
+    "proxy": "",
+    "proxy_randomize_credentials": false
+  }
+  ],
+  "relayfee": 1e-6,
+  "localaddresses": [],
+  "warnings": ""
+}
+"#;
+
+    let obj: GetNetworkInfoResponse = serde_json::from_str(json)?;
+
+    let version = obj.version;
+    let subversion = obj.subversion.clone();
+    let protocol_version = obj.protocol_version;
+    let local_services = obj.local_services.clone();
+    let timeoffset = obj.timeoffset;
+    let connections = obj.connections;
+    let networks = obj.networks.clone();
+    let relay_fee = obj.relay_fee;
+    let local_addresses = obj.local_addresses.clone();
+    let warnings = obj.warnings.clone();
+
+    let new_obj = GetNetworkInfoResponse {
+        version,
+        subversion,
+        protocol_version,
+        local_services,
+        timeoffset,
+        connections,
+        networks,
+        relay_fee,
+        local_addresses,
+        warnings,
+    };
+
+    assert_eq!(obj, new_obj);
+
+    Ok(())
+}
+
+#[test]
 fn test_get_peer_info() -> Result<(), Box<dyn std::error::Error>> {
     let json = r#"
 [
   {
     "addr": "192.168.0.1:8233",
-    "inbound": false
+    "services": "0000000000000001",
+    "lastrecv": 1700000000,
+    "inbound": false,
+    "banscore": 0,
+    "subver": "/Zebra:2.1.0/",
+    "version": 170140,
+    "connection_state": "connected"
   },
   {
     "addr": "[2000:2000:2000:0000::]:8233",
-    "inbound": false
+    "services": "0000000000000001",
+    "lastrecv": 1700000000,
+    "inbound": false,
+    "banscore": 0,
+    "subver": "/zcashd:5.8.0/",
+    "version": 170100,
+    "connection_state": "connected"
   }
 ]
 "#;
     let obj: GetPeerInfoResponse = serde_json::from_str(json)?;
 
-    let addr0 = *obj[0].addr().deref();
-    let inbound0 = obj[0].inbound();
-    let addr1 = *obj[1].addr().deref();
-    let inbound1 = obj[1].inbound();
+    assert_eq!(obj.len(), 2);
+    assert_eq!(obj[0].services().as_str(), "0000000000000001");
+    assert_eq!(obj[0].lastrecv(), 1700000000);
+    assert_eq!(obj[0].banscore(), 0);
+    assert_eq!(obj[0].subver().as_str(), "/Zebra:2.1.0/");
+    assert_eq!(obj[0].version(), 170140);
+    assert_eq!(obj[0].connection_state().as_str(), "connected");
 
-    let new_obj = vec![
-        PeerInfo::new(addr0.into(), inbound0),
-        PeerInfo::new(addr1.into(), inbound1),
-    ];
-    assert_eq!(obj, new_obj);
+    Ok(())
+}
+
+#[test]
+fn test_get_peer_info_with_ping_values_serialization() -> Result<(), Box<dyn std::error::Error>> {
+    let json = r#"
+[
+  {
+    "addr": "192.168.0.1:8233",
+    "services": "0000000000000001",
+    "lastrecv": 1700000000,
+    "inbound": false,
+    "banscore": 0,
+    "subver": "/Zebra:2.1.0/",
+    "version": 170140,
+    "connection_state": "connected",
+    "pingtime": 123,
+    "pingwait": 45
+  },
+  {
+    "addr": "[2000:2000:2000:0000::]:8233",
+    "services": "0000000000000001",
+    "lastrecv": 1700000000,
+    "inbound": false,
+    "banscore": 0,
+    "subver": "/zcashd:5.8.0/",
+    "version": 170100,
+    "connection_state": "connected",
+    "pingtime": 67,
+    "pingwait": 89
+  }
+]
+"#;
+    let obj: GetPeerInfoResponse = serde_json::from_str(json)?;
+
+    assert_eq!(obj.len(), 2);
+    assert_eq!(*obj[0].pingtime(), Some(123.0));
+    assert_eq!(*obj[0].pingwait(), Some(45.0));
+    assert_eq!(*obj[1].pingtime(), Some(67.0));
+    assert_eq!(*obj[1].pingwait(), Some(89.0));
 
     Ok(())
 }
@@ -1227,9 +1411,9 @@ fn test_get_block_subsidy() -> Result<(), Box<dyn std::error::Error>> {
             let specification = stream.specification().clone();
             let value = stream.value();
             let value_zat = stream.value_zat();
-            let address = stream.address().clone();
+            let address = stream.address();
 
-            FundingStream::new(recipient, specification, value, value_zat, address)
+            FundingStream::new(recipient, specification, value, value_zat, *address)
         })
         .collect::<Vec<_>>();
     let lockbox_streams = obj.lockbox_streams().clone();

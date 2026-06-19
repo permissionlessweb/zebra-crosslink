@@ -73,22 +73,23 @@
 //!
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use abscissa_core::{config, Command, FrameworkError};
 use color_eyre::eyre::{eyre, Report};
 use futures::FutureExt;
-use tokio::{pin, select, sync::oneshot, time::timeout};
+use tokio::{pin, select, sync::oneshot};
 use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
 
 use zebra_chain::block::genesis::regtest_genesis_block;
-use zebra_consensus::{router::BackgroundTaskHandles, ParameterCheckpoint};
+use zebra_consensus::router::BackgroundTaskHandles;
 use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
 use crate::{
     application::{build_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
     components::{
+        health,
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
         mempool::{self, Mempool},
         sync::{self, show_block_chain_progress, VERIFICATION_PIPELINE_SCALING_MULTIPLIER},
@@ -102,8 +103,6 @@ use crate::{
 #[cfg(feature = "internal-miner")]
 use crate::components;
 
-use tower::Service;
-
 /// Start the application (default command)
 #[derive(Command, Debug, Default, clap::Parser)]
 pub struct StartCmd {
@@ -112,42 +111,55 @@ pub struct StartCmd {
     filters: Vec<String>,
 }
 
+/// Warns if Linux TCP slow-start-after-idle is enabled, which significantly
+/// reduces single-peer throughput for block propagation.
+///
+/// See `book/src/user/troubleshooting.md`.
+#[cfg(target_os = "linux")]
+fn check_tcp_slow_start_after_idle() {
+    const PATH: &str = "/proc/sys/net/ipv4/tcp_slow_start_after_idle";
+
+    let raw = match std::fs::read_to_string(PATH) {
+        Ok(raw) => raw,
+        Err(error) => {
+            debug!(
+                ?error,
+                path = PATH,
+                "could not read TCP sysctl, skipping check"
+            );
+            return;
+        }
+    };
+
+    if raw.trim() == "0" {
+        return;
+    }
+
+    warn!(
+        setting = "net.ipv4.tcp_slow_start_after_idle",
+        "TCP slow-start-after-idle is enabled, which resets TCP's congestion window \
+         between block requests and significantly reduces single-peer throughput for \
+         block propagation. \
+         Hint: set `net.ipv4.tcp_slow_start_after_idle=0` via sysctl. \
+         See https://zebra.zfnd.org/user/troubleshooting.html#linux-tcp-tuning-for-block-propagation"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_tcp_slow_start_after_idle() {}
+
 impl StartCmd {
     async fn start(&self) -> Result<(), Report> {
+        check_tcp_slow_start_after_idle();
+
         let config = APPLICATION.config();
         let is_regtest = config.network.network.is_regtest();
 
         let config = if is_regtest {
-            fn add_to_port(mut addr: std::net::SocketAddr, addend: u16) -> std::net::SocketAddr {
-                addr.set_port(addr.port() + addend);
-                addr
-            }
-            let nextest_slot: u16 = if let Ok(str) = std::env::var("NEXTEST_TEST_GLOBAL_SLOT") {
-                if let Ok(slot) = str.parse::<u16>() {
-                    slot
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-
             Arc::new(ZebradConfig {
                 mempool: mempool::Config {
                     debug_enable_at_height: Some(0),
                     ..config.mempool
-                },
-                network: zebra_network::config::Config {
-                    listen_addr: add_to_port(config.network.listen_addr.clone(), nextest_slot * 7),
-                    ..config.network.clone()
-                },
-                rpc: zebra_rpc::config::rpc::Config {
-                    listen_addr: config
-                        .rpc
-                        .listen_addr
-                        .clone()
-                        .map(|addr| add_to_port(addr, nextest_slot * 7)),
-                    ..config.rpc.clone()
                 },
                 ..Arc::unwrap_or_clone(config)
             })
@@ -164,14 +176,14 @@ impl StartCmd {
         info!("opening database, this may take a few minutes");
 
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zebra_state::spawn_init(
+            zebra_state::init(
                 config.state.clone(),
                 &config.network.network,
                 max_checkpoint_height,
                 config.sync.checkpoint_verify_concurrency_limit
                     * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
             )
-            .await?;
+            .await;
 
         info!("logging database metrics on startup");
         read_only_state_service.log_db_metrics();
@@ -208,6 +220,8 @@ impl StartCmd {
             user_agent(),
         )
         .await;
+
+        // Start health server if configured (after sync_status is available)
 
         info!("initializing verifiers");
         let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();
@@ -271,125 +285,6 @@ impl StartCmd {
         // Create a channel to send mined blocks to the gossip task
         let submit_block_channel = SubmitBlockChannel::new();
 
-        let gbt_for_force_feeding_pow = Arc::new(
-            zebra_rpc::methods::types::get_block_template::GetBlockTemplateHandler::new(
-                &config.network.network.clone(),
-                config.mining.clone(),
-                block_verifier_router.clone(),
-                sync_status.clone(),
-                Some(submit_block_channel.sender()),
-            ),
-        );
-
-        let mempool2 = mempool.clone();
-        info!("spawning tfl service task");
-        let (tfl, tfl_service_task_handle) = {
-            let state = state.clone();
-            zebra_crosslink::service::spawn_new_tfl_service(
-                is_regtest,
-                Arc::new(move |req| {
-                    let state = state.clone();
-                    Box::pin(async move { state.clone().ready().await?.call(req).await })
-                }),
-                Arc::new(move |req| {
-                    let mempool = mempool2.clone();
-                    Box::pin(async move { mempool.clone().ready().await?.call(req).await })
-                }),
-                Arc::new(move |block| {
-                    let gbt = Arc::clone(&gbt_for_force_feeding_pow);
-
-                    let height = block
-                        .coinbase_height()
-                        // .ok_or_error(0, "coinbase height not found")?;
-                        .unwrap();
-
-                    let parent_hash = block.header.previous_block_hash;
-                    let block_hash = block.hash();
-
-                    Box::pin(async move {
-                        let attempt_result = timeout(Duration::from_millis(100), async move {
-                            let mut block_verifier_router = gbt.block_verifier_router();
-
-                            let height = block
-                                .coinbase_height()
-                                // .ok_or_error(0, "coinbase height not found")?;
-                                .unwrap();
-                            let block_hash = block.hash();
-
-                            let block_verifier_router_response =
-                                block_verifier_router.ready().await;
-                            if block_verifier_router_response.is_err() {
-                                return false;
-                            }
-                            let block_verifier_router_response =
-                                block_verifier_router_response.unwrap();
-
-                            // .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
-                            let block_verifier_router_response = block_verifier_router_response
-                                .call(zebra_consensus::Request::Commit(block))
-                                .await;
-
-                            match block_verifier_router_response {
-                                // Currently, this match arm returns `null` (Accepted) for blocks committed
-                                // to any chain, but Accepted is only for blocks in the best chain.
-                                //
-                                // TODO (#5487):
-                                // - Inconclusive: check if the block is on a side-chain
-                                // The difference is important to miners, because they want to mine on the best chain.
-                                Ok(hash) => {
-                                    tracing::info!(?hash, ?height, "submit block accepted");
-
-                                    // gbt.advertise_mined_block(hash, height)
-                                    //     // .map_error_with_prefix(0, "failed to send mined block")?;
-                                    //     .unwrap();
-
-                                    // return Ok(submit_block::Response::Accepted);
-                                    true
-                                }
-
-                                // Turns BoxError into Result<VerifyChainError, BoxError>,
-                                // by downcasting from Any to VerifyChainError.
-                                Err(box_error) => {
-                                    let error = box_error
-                                        .downcast::<zebra_consensus::RouterError>()
-                                        .map(|boxed_chain_error| *boxed_chain_error);
-
-                                    tracing::error!(
-                                        ?error,
-                                        ?block_hash,
-                                        ?height,
-                                        "submit block failed verification"
-                                    );
-
-                                    // error
-                                    false
-                                }
-                            }
-                        })
-                        .await;
-
-                        match attempt_result {
-                            Ok(success) => {
-                                return success;
-                            }
-                            Err(_) => {
-                                tracing::error!(
-                                    ?height,
-                                    ?block_hash,
-                                    ?parent_hash,
-                                    "submit block timed out"
-                                );
-                                return false;
-                            }
-                        }
-                    })
-                }),
-                config.crosslink.clone(),
-            )
-        };
-        let tfl_service = BoxService::new(tfl);
-        let tfl_service = ServiceBuilder::new().buffer(1).service(tfl_service);
-
         // Launch RPC server
         let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new(
             config.network.network.clone(),
@@ -398,7 +293,6 @@ impl StartCmd {
             build_version(),
             user_agent(),
             mempool.clone(),
-            tfl_service.clone(),
             state.clone(),
             read_only_state_service.clone(),
             block_verifier_router.clone(),
@@ -469,14 +363,28 @@ impl StartCmd {
         );
 
         info!("spawning progress logging task");
+        let (chain_tip_metrics_sender, chain_tip_metrics_receiver) =
+            health::ChainTipMetrics::channel();
         let progress_task_handle = tokio::spawn(
             show_block_chain_progress(
                 config.network.network.clone(),
                 latest_chain_tip.clone(),
                 sync_status.clone(),
+                chain_tip_metrics_sender,
             )
             .in_current_span(),
         );
+
+        // Start health server if configured
+        info!("initializing health endpoints");
+        let (health_task_handle, _) = health::init(
+            config.health.clone(),
+            config.network.network.clone(),
+            chain_tip_metrics_receiver,
+            sync_status.clone(),
+            address_book.clone(),
+        )
+        .await;
 
         // Spawn never ending end of support task.
         info!("spawning end of support checking task");
@@ -501,28 +409,29 @@ impl StartCmd {
         );
 
         info!("spawning syncer task");
-        let syncer_task_handle = if is_regtest {
-            if !syncer
+        // In regtest, commit the genesis block directly (bypassing the syncer's genesis
+        // download, which requires a connected peer). Then run the syncer normally so
+        // that multi-hop block propagation works: gossiped blocks that arrive out of
+        // order (e.g. only the latest tip hash was gossiped) will be recovered by the
+        // syncer using block locators within REGTEST_SYNC_RESTART_DELAY (2 seconds).
+        if is_regtest
+            && !syncer
                 .state_contains(config.network.network.genesis_hash())
                 .await?
-            {
-                let genesis_hash = block_verifier_router
-                    .clone()
-                    .oneshot(zebra_consensus::Request::Commit(regtest_genesis_block()))
-                    .await
-                    .expect("should validate Regtest genesis block");
+        {
+            let genesis_hash = block_verifier_router
+                .clone()
+                .oneshot(zebra_consensus::Request::Commit(regtest_genesis_block()))
+                .await
+                .expect("should validate Regtest genesis block");
 
-                assert_eq!(
-                    genesis_hash,
-                    config.network.network.genesis_hash(),
-                    "validated block hash should match network genesis hash"
-                )
-            }
-
-            tokio::spawn(std::future::pending().in_current_span())
-        } else {
-            tokio::spawn(syncer.sync().in_current_span())
-        };
+            assert_eq!(
+                genesis_hash,
+                config.network.network.genesis_hash(),
+                "validated block hash should match network genesis hash"
+            )
+        }
+        let syncer_task_handle = tokio::spawn(syncer.sync().in_current_span());
 
         // And finally, spawn the internal Zcash miner, if it is enabled.
         //
@@ -530,7 +439,7 @@ impl StartCmd {
         #[cfg(feature = "internal-miner")]
         let miner_task_handle = if config.mining.is_internal_miner_enabled() {
             info!("spawning Zcash miner");
-            components::miner::spawn_init(&config.network.network, &config.metrics, rpc_impl)
+            components::miner::spawn_init(&config.metrics, rpc_impl)
         } else {
             tokio::spawn(std::future::pending().in_current_span())
         };
@@ -552,7 +461,6 @@ impl StartCmd {
         pin!(mempool_crawler_task_handle);
         pin!(mempool_queue_checker_task_handle);
         pin!(tx_gossip_task_handle);
-        pin!(tfl_service_task_handle);
         pin!(progress_task_handle);
         pin!(end_of_support_task_handle);
         pin!(miner_task_handle);
@@ -618,11 +526,6 @@ impl StartCmd {
                     .map(|_| info!("transaction gossip task exited"))
                     .map_err(|e| eyre!(e)),
 
-                tfl_service_result = &mut tfl_service_task_handle => tfl_service_result
-                    .expect("unexpected panic in the tfl service task")
-                    .map(|_| info!("tfl service task exited"))
-                    .map_err(|e| eyre!(e)),
-
                 // The progress task runs forever, unless it panics.
                 // So we don't need to provide an exit status for it.
                 progress_result = &mut progress_task_handle => {
@@ -676,12 +579,12 @@ impl StartCmd {
         // ongoing tasks
         rpc_task_handle.abort();
         rpc_tx_queue_handle.abort();
+        health_task_handle.abort();
         syncer_task_handle.abort();
         block_gossip_task_handle.abort();
         mempool_crawler_task_handle.abort();
         mempool_queue_checker_task_handle.abort();
         tx_gossip_task_handle.abort();
-        tfl_service_task_handle.abort();
         progress_task_handle.abort();
         end_of_support_task_handle.abort();
         miner_task_handle.abort();

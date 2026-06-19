@@ -10,7 +10,6 @@ use eyre::Result;
 /// Test the MMR tree using the activation block of a network upgrade
 /// and its next block.
 #[test]
-#[ignore] // [ACTIVATION HEIGHT PROBLEM]
 fn tree() -> Result<()> {
     for network in Network::iter() {
         tree_for_network_upgrade(&network, NetworkUpgrade::Heartwood)?;
@@ -74,7 +73,7 @@ fn tree_for_network_upgrade(network: &Network, network_upgrade: NetworkUpgrade) 
         .append_leaf(block1, &sapling_root1, &Default::default())
         .unwrap();
 
-    // Tree how has 3 nodes: two leafs for each block, and one parent node
+    // Tree how has 3 nodes: two leaves for each block, and one parent node
     // which is the new root
     assert_eq!(tree.inner.len(), 3);
     // Two nodes were appended: the new leaf and the parent node

@@ -20,7 +20,6 @@ use zebra_chain::{
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
     diagnostic::task::WaitForPanics,
-    parameters::Network,
     serialization::{AtLeastOne, ZcashSerialize},
     shutdown::is_shutting_down,
     work::equihash::{Solution, SolverCancelled},
@@ -60,28 +59,9 @@ pub const BLOCK_MINING_WAIT_TIME: Duration = Duration::from_secs(3);
 /// mining thread.
 ///
 /// See [`run_mining_solver()`] for more details.
-pub fn spawn_init<
-    Mempool,
-    TFLService,
-    State,
-    ReadState,
-    Tip,
-    AddressBook,
-    BlockVerifierRouter,
-    SyncStatus,
->(
-    network: &Network,
+pub fn spawn_init<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>(
     config: &Config,
-    rpc: RpcImpl<
-        Mempool,
-        TFLService,
-        State,
-        ReadState,
-        Tip,
-        AddressBook,
-        BlockVerifierRouter,
-        SyncStatus,
-    >,
+    rpc: RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>,
 ) -> JoinHandle<Result<(), Report>>
 // TODO: simplify or avoid repeating these generics (how?)
 where
@@ -94,15 +74,6 @@ where
         + Sync
         + 'static,
     Mempool::Future: Send,
-    TFLService: Service<
-            zebra_state::crosslink::TFLServiceRequest,
-            Response = zebra_state::crosslink::TFLServiceResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    TFLService::Future: Send,
     State: Service<
             zebra_state::Request,
             Response = zebra_state::Response,
@@ -132,7 +103,7 @@ where
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
     // TODO: spawn an entirely new executor here, so mining is isolated from higher priority tasks.
-    tokio::spawn(init(network.clone(), config.clone(), rpc).in_current_span())
+    tokio::spawn(init(config.clone(), rpc).in_current_span())
 }
 
 /// Initialize the miner based on its config.
@@ -141,28 +112,9 @@ where
 /// mining thread.
 ///
 /// See [`run_mining_solver()`] for more details.
-pub async fn init<
-    Mempool,
-    TFLService,
-    State,
-    ReadState,
-    Tip,
-    BlockVerifierRouter,
-    SyncStatus,
-    AddressBook,
->(
-    network: Network,
+pub async fn init<Mempool, State, ReadState, Tip, BlockVerifierRouter, SyncStatus, AddressBook>(
     _config: Config,
-    rpc: RpcImpl<
-        Mempool,
-        TFLService,
-        State,
-        ReadState,
-        Tip,
-        AddressBook,
-        BlockVerifierRouter,
-        SyncStatus,
-    >,
+    rpc: RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>,
 ) -> Result<(), Report>
 where
     Mempool: Service<
@@ -174,15 +126,6 @@ where
         + Sync
         + 'static,
     Mempool::Future: Send,
-    TFLService: Service<
-            zebra_state::crosslink::TFLServiceRequest,
-            Response = zebra_state::crosslink::TFLServiceResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    TFLService::Future: Send,
     State: Service<
             zebra_state::Request,
             Response = zebra_state::Response,
@@ -234,7 +177,7 @@ where
     let mut abort_handles = Vec::new();
 
     let template_generator = tokio::task::spawn(
-        generate_block_templates(network, rpc.clone(), template_sender).in_current_span(),
+        generate_block_templates(rpc.clone(), template_sender).in_current_span(),
     );
     abort_handles.push(template_generator.abort_handle());
     let template_generator = template_generator.wait_for_panics();
@@ -279,11 +222,9 @@ where
 }
 
 /// Generates block templates using `rpc`, and sends them to mining threads using `template_sender`.
-// Note(Sam): Very very noisy.
-//#[instrument(skip(rpc, template_sender))]
+#[instrument(skip(rpc, template_sender))]
 pub async fn generate_block_templates<
     Mempool,
-    TFLService,
     State,
     ReadState,
     Tip,
@@ -291,17 +232,7 @@ pub async fn generate_block_templates<
     SyncStatus,
     AddressBook,
 >(
-    network: Network,
-    rpc: RpcImpl<
-        Mempool,
-        TFLService,
-        State,
-        ReadState,
-        Tip,
-        AddressBook,
-        BlockVerifierRouter,
-        SyncStatus,
-    >,
+    rpc: RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>,
     template_sender: watch::Sender<Option<Arc<Block>>>,
 ) -> Result<(), Report>
 where
@@ -314,15 +245,6 @@ where
         + Sync
         + 'static,
     Mempool::Future: Send,
-    TFLService: Service<
-            zebra_state::crosslink::TFLServiceRequest,
-            Response = zebra_state::crosslink::TFLServiceResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    TFLService::Future: Send,
     State: Service<
             zebra_state::Request,
             Response = zebra_state::Response,
@@ -403,7 +325,7 @@ where
 
         // If the template has actually changed, send an updated template.
         template_sender.send_if_modified(|old_block| {
-            if old_block.as_ref().map(|b| b.header.clone()) == Some(block.header.clone()) {
+            if old_block.as_ref().map(|b| *b.header) == Some(*block.header) {
                 return false;
             }
             *old_block = Some(Arc::new(block));
@@ -429,7 +351,6 @@ where
 #[instrument(skip(template_receiver, rpc))]
 pub async fn run_mining_solver<
     Mempool,
-    TFLService,
     State,
     ReadState,
     Tip,
@@ -439,16 +360,7 @@ pub async fn run_mining_solver<
 >(
     solver_id: u8,
     mut template_receiver: WatchReceiver<Option<Arc<Block>>>,
-    rpc: RpcImpl<
-        Mempool,
-        TFLService,
-        State,
-        ReadState,
-        Tip,
-        AddressBook,
-        BlockVerifierRouter,
-        SyncStatus,
-    >,
+    rpc: RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>,
 ) -> Result<(), Report>
 where
     Mempool: Service<
@@ -460,15 +372,6 @@ where
         + Sync
         + 'static,
     Mempool::Future: Send,
-    TFLService: Service<
-            zebra_state::crosslink::TFLServiceRequest,
-            Response = zebra_state::crosslink::TFLServiceResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    TFLService::Future: Send,
     State: Service<
             zebra_state::Request,
             Response = zebra_state::Response,
@@ -531,7 +434,7 @@ where
 
         // Set up the cancellation conditions for the miner.
         let mut cancel_receiver = template_receiver.clone();
-        let old_header = zebra_chain::block::Header::clone(&template.header);
+        let old_header = *template.header;
         let cancel_fn = move || match cancel_receiver.has_changed() {
             // Guard against get_block_template() providing an identical header. This could happen
             // if something irrelevant to the block data changes, the time was within 1 second, or
@@ -542,10 +445,7 @@ where
                 // We only need to check header equality, because the block data is bound to the
                 // header.
                 if has_changed
-                    && Some(old_header.clone())
-                        != cancel_receiver
-                            .cloned_watch_data()
-                            .map(|b| zebra_chain::block::Header::clone(&b.header))
+                    && Some(old_header) != cancel_receiver.cloned_watch_data().map(|b| *b.header)
                 {
                     Err(SolverCancelled)
                 } else {
@@ -658,19 +558,13 @@ where
 {
     // TODO: Replace with Arc::unwrap_or_clone() when it stabilises:
     // https://github.com/rust-lang/rust/issues/93610
-    let mut header = zebra_chain::block::Header::clone(&template.header);
+    let mut header = *template.header;
 
     // Use a different nonce for each solver thread.
     // Change both the first and last bytes, so we don't have to care if the nonces are incremented in
     // big-endian or little-endian order. And we can see the thread that mined a block from the nonce.
     *header.nonce.first_mut().unwrap() = solver_id;
     *header.nonce.last_mut().unwrap() = solver_id;
-
-    #[cfg(feature = "viz_gui")]
-    {
-        header.nonce[30] = *zebra_crosslink::viz::MINER_NONCE_BYTE.lock().unwrap();
-        println!("PoW Block Nonce: {:?}", header.nonce);
-    }
 
     // Mine one or more blocks using the solver, in a low-priority blocking thread.
     let span = Span::current();

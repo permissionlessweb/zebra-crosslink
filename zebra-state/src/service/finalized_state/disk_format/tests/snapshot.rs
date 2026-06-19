@@ -43,7 +43,6 @@ use crate::{
 /// Snapshot test for RocksDB column families, and their key-value data.
 ///
 /// These snapshots contain the `default` column family, but it is not used by Zebra.
-#[ignore] // [ACTIVATION HEIGHT PROBLEM]
 #[test]
 fn test_raw_rocksdb_column_families() {
     let _init_guard = zebra_test::init();

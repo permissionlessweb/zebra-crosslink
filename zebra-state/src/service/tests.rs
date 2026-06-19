@@ -1,12 +1,16 @@
 //! StateService test vectors.
-//!
-//! TODO: move these tests into tests::vectors and tests::prop modules.
+
+#![allow(clippy::unwrap_in_result)]
+
+// TODO: move these tests into tests::vectors and tests::prop modules.
 
 use std::{env, sync::Arc, time::Duration};
 
+use tokio::runtime::Runtime;
 use tower::{buffer::Buffer, util::BoxService};
 
 use zebra_chain::{
+    amount::DeferredPoolBalanceChange,
     block::{self, Block, CountedHeader, Height},
     chain_tip::ChainTip,
     fmt::SummaryDebug,
@@ -75,19 +79,12 @@ async fn test_populated_state_responds_correctly(
 
         // Spec: transactions in the genesis block are ignored.
         if height.0 != 0 {
-            use chrono::Utc;
             for transaction in &block.transactions {
                 let transaction_hash = transaction.hash();
 
                 transcript.push((
                     Request::Transaction(transaction_hash),
-                    Ok(Response::Transaction(Some(crate::MinedTx {
-                        tx: transaction.clone(),
-                        height,
-                        // TODO: fix
-                        confirmations: 0,
-                        block_time: Utc::now(),
-                    }))),
+                    Ok(Response::Transaction(Some(transaction.clone()))),
                 ));
             }
         }
@@ -260,7 +257,7 @@ async fn empty_state_still_responds_to_requests() -> Result<()> {
     let transcript = Transcript::from(iter);
 
     let network = Network::Mainnet;
-    let state = init_test(&network);
+    let state = init_test(&network).await;
 
     transcript.check(state).await?;
 
@@ -268,7 +265,6 @@ async fn empty_state_still_responds_to_requests() -> Result<()> {
 }
 
 #[test]
-#[ignore] // [UNKNOWN PROBLEM]
 fn state_behaves_when_blocks_are_committed_in_order() -> Result<()> {
     let _init_guard = zebra_test::init();
 
@@ -302,7 +298,6 @@ proptest! {
     )]
 
     /// Test out of order commits of continuous block test vectors from genesis onward.
-    #[ignore] // [UNKNOWN PROBLEM]
     #[test]
     fn state_behaves_when_blocks_are_committed_out_of_order(blocks in out_of_order_committing_strategy()) {
         let _init_guard = zebra_test::init();
@@ -385,7 +380,6 @@ proptest! {
     }
 
     /// Test there is at least one transaction with a valid `network_upgrade` in the legacy check.
-    #[ignore] // [ACTIVATION HEIGHT PROBLEM]
     #[test]
     fn at_least_one_transaction_with_valid_network_upgrade(
         (network, nu_activation_height, chain) in partial_nu5_chain_strategy(5, true, UNDER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Canopy)
@@ -403,16 +397,16 @@ proptest! {
     /// 3. Commit the finalized blocks and check that the value pool is updated accordingly.
     /// 4. Commit the non-finalized blocks and check that the value pool is also updated
     ///    accordingly.
-    #[ignore] // [ACTIVATION HEIGHT PROBLEM]
     #[test]
     fn value_pool_is_updated(
         (network, finalized_blocks, non_finalized_blocks)
             in continuous_empty_blocks_from_test_vectors(),
     ) {
         let _init_guard = zebra_test::init();
-
-        // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
-        let (mut state_service, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0);
+        let (mut state_service, _, _, _) = Runtime::new().unwrap().block_on(async {
+            // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
+            StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await
+        });
 
         prop_assert_eq!(state_service.read_service.db.finalized_value_pool(), ValueBalance::zero());
         prop_assert_eq!(
@@ -431,7 +425,7 @@ proptest! {
             // which is not included in the UTXO set
             if block.height > block::Height(0) {
                 let utxos = &block.new_outputs.iter().map(|(k, ordered_utxo)| (*k, ordered_utxo.utxo.clone())).collect();
-                let block_value_pool = &block.block.chain_value_pool_change(utxos, None)?;
+                let block_value_pool = &block.block.chain_value_pool_change(utxos, DeferredPoolBalanceChange::zero())?;
                 expected_finalized_value_pool += *block_value_pool;
             }
 
@@ -458,7 +452,7 @@ proptest! {
         let mut expected_non_finalized_value_pool = Ok(expected_finalized_value_pool?);
         for block in non_finalized_blocks {
             let utxos = block.new_outputs.clone();
-            let block_value_pool = &block.block.chain_value_pool_change(&transparent::utxos_from_ordered_utxos(utxos), None)?;
+            let block_value_pool = &block.block.chain_value_pool_change(&transparent::utxos_from_ordered_utxos(utxos), DeferredPoolBalanceChange::zero())?;
             expected_non_finalized_value_pool += *block_value_pool;
 
             let result_receiver = state_service.queue_and_commit_to_non_finalized_state(block.clone());
@@ -496,7 +490,6 @@ proptest! {
     /// 3. Commit the finalized blocks and check that the best tip height is updated accordingly.
     /// 4. Commit the non-finalized blocks and check that the best tip height is also updated
     ///    accordingly.
-    #[ignore] // [ACTIVATION HEIGHT PROBLEM]
     #[test]
     fn chain_tip_sender_is_updated(
         (network, finalized_blocks, non_finalized_blocks)
@@ -504,8 +497,10 @@ proptest! {
     ) {
         let _init_guard = zebra_test::init();
 
-        // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
-        let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0);
+        let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change) = Runtime::new().unwrap().block_on(async {
+            // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
+            StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await
+        });
 
         prop_assert_eq!(latest_chain_tip.best_tip_height(), None);
         prop_assert_eq!(chain_tip_change.last_tip_change(), None);
@@ -513,9 +508,14 @@ proptest! {
         for block in finalized_blocks {
             let expected_block = block.clone();
 
-            let expected_action = if expected_block.height <= block::Height(1) {
-                // 0: reset by both initialization and the Genesis network upgrade
-                // 1: reset by the BeforeOverwinter network upgrade
+            let expected_action = if expected_block.height == block::Height(0) {
+                // 0: reset on initialization.
+                //
+                // The mempool verifies transactions against the next block height, so the
+                // reset for an upgrade activating at height `H` happens when the tip reaches
+                // `H - 1`. The only activation height whose predecessor is in the test vectors
+                // is BeforeOverwinter (height 1), so its reset coincides with the genesis block
+                // at height 0, which already resets on initialization.
                 TipAction::reset_with(expected_block.clone().into())
             } else {
                 TipAction::grow_with(expected_block.clone().into())
@@ -537,12 +537,13 @@ proptest! {
         for block in non_finalized_blocks {
             let expected_block = block.clone();
 
-            let expected_action = if expected_block.height == block::Height(1) {
-                // 1: reset by the BeforeOverwinter network upgrade
-                TipAction::reset_with(expected_block.clone().into())
-            } else {
-                TipAction::grow_with(expected_block.clone().into())
-            };
+            // Non-finalized blocks are continuous with the finalized tip and always at height
+            // >= 1 (genesis is always finalized). The reset for an upgrade activating at height
+            // `H` happens when the tip reaches `H - 1`, and the only activation height with a
+            // predecessor in the test vectors is BeforeOverwinter (height 1, predecessor height
+            // 0, which is always finalized). So no non-finalized block triggers an activation
+            // reset: they all grow.
+            let expected_action = TipAction::grow_with(expected_block.clone().into());
 
             let result_receiver = state_service.queue_and_commit_to_non_finalized_state(block);
             let result = result_receiver.blocking_recv();

@@ -7,6 +7,9 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+use zebra_rpc::config::mining::{default_miner_address, MinerAddressType};
+
+use crate::components::With;
 
 /// Centralized, case-insensitive suffix-based deny-list to ban setting config fields with
 /// environment variables if those config field names end with any of these suffixes.
@@ -78,8 +81,11 @@ pub struct ZebradConfig {
     /// Mining configuration
     pub mining: zebra_rpc::config::mining::Config,
 
-    /// CrossLink configuration
-    pub crosslink: zebra_crosslink::config::Config,
+    /// Health check HTTP server configuration.
+    ///
+    /// See the Zebra Book for details and examples:
+    /// <https://zebra.zfnd.org/user/health.html>
+    pub health: crate::components::health::Config,
 }
 
 impl ZebradConfig {
@@ -129,7 +135,11 @@ impl ZebradConfig {
 
         // 2. Add TOML configuration file as a source if provided
         if let Some(path) = config_path {
-            builder = builder.add_source(config::File::from(path).required(true));
+            builder = builder.add_source(
+                config::File::from(path)
+                    .format(config::FileFormat::Toml)
+                    .required(true),
+            );
         }
 
         // 3. Load from environment variables (with a sensitive-leaf deny-list)
@@ -169,5 +179,17 @@ impl ZebradConfig {
         let config = builder.build()?;
         // Deserialize into our struct, which will use defaults for any missing fields
         config.try_deserialize()
+    }
+}
+
+impl With<MinerAddressType> for ZebradConfig {
+    fn with(mut self, miner_address_type: MinerAddressType) -> Self {
+        self.mining.miner_address = Some(
+            default_miner_address(self.network.network.kind(), &miner_address_type)
+                .parse()
+                .expect("valid hard-coded address"),
+        );
+
+        self
     }
 }

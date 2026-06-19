@@ -1,6 +1,6 @@
 //! Fixed test vectors for the peer set.
 
-use std::{cmp::max, iter, time::Duration};
+use std::{cmp::max, collections::HashSet, iter, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::time::timeout;
 use tower::{Service, ServiceExt};
@@ -15,8 +15,10 @@ use crate::{
     peer::{ClientRequest, MinimumPeerVersion},
     peer_set::inventory_registry::InventoryStatus,
     protocol::external::{types::Version, InventoryHash},
-    Request, SharedPeerError,
+    PeerSocketAddr, Request, SharedPeerError,
 };
+use indexmap::IndexMap;
+use tokio::sync::watch;
 
 use super::{PeerSetBuilder, PeerVersions};
 
@@ -26,7 +28,7 @@ fn peer_set_ready_single_connection() {
     let peer_versions = PeerVersions {
         peer_versions: vec![Version::min_specified_for_upgrade(
             &Network::Mainnet,
-            NetworkUpgrade::Nu6,
+            NetworkUpgrade::Nu6_2,
         )],
     };
 
@@ -118,7 +120,7 @@ fn peer_set_ready_single_connection() {
 #[test]
 fn peer_set_ready_multiple_connections() {
     // Use three peers with the same version
-    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
     let peer_versions = PeerVersions {
         peer_versions: vec![peer_version, peer_version, peer_version],
     };
@@ -182,7 +184,7 @@ fn peer_set_rejects_connections_past_per_ip_limit() {
     const NUM_PEER_VERSIONS: usize = crate::constants::DEFAULT_MAX_CONNS_PER_IP + 1;
 
     // Use three peers with the same version
-    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
     let peer_versions = PeerVersions {
         peer_versions: [peer_version; NUM_PEER_VERSIONS].into_iter().collect(),
     };
@@ -232,7 +234,7 @@ fn peer_set_route_inv_empty_registry() {
     let test_hash = block::Hash([0; 32]);
 
     // Use two peers with the same version
-    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
     let peer_versions = PeerVersions {
         peer_versions: vec![peer_version, peer_version],
     };
@@ -291,6 +293,101 @@ fn peer_set_route_inv_empty_registry() {
     });
 }
 
+#[test]
+fn broadcast_all_queued_removes_banned_peers() {
+    let peer_versions = PeerVersions {
+        peer_versions: vec![Version::min_specified_for_upgrade(
+            &Network::Mainnet,
+            NetworkUpgrade::Nu6_2,
+        )],
+    };
+
+    let (runtime, _init_guard) = zebra_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, _handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version.clone())
+            .build();
+
+        let banned_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let mut bans_map: IndexMap<std::net::IpAddr, std::time::Instant> = IndexMap::new();
+        bans_map.insert(banned_ip, std::time::Instant::now());
+
+        let (bans_tx, bans_rx) = watch::channel(Arc::new(bans_map));
+        let _ = bans_tx;
+        peer_set.bans_receiver = bans_rx;
+
+        let banned_addr: PeerSocketAddr = SocketAddr::new(banned_ip, 1).into();
+        let mut remaining_peers = HashSet::new();
+        remaining_peers.insert(banned_addr);
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        peer_set.queued_broadcast_all = Some((Request::Peers, sender, remaining_peers));
+
+        peer_set.broadcast_all_queued();
+
+        if let Some((_req, _sender, remaining_peers)) = peer_set.queued_broadcast_all.take() {
+            assert!(remaining_peers.is_empty());
+        } else {
+            assert!(receiver.try_recv().is_ok());
+        }
+    });
+}
+
+#[test]
+fn remove_unready_peer_clears_cancel_handle_and_updates_counts() {
+    let peer_versions = PeerVersions {
+        peer_versions: vec![Version::min_specified_for_upgrade(
+            &Network::Mainnet,
+            NetworkUpgrade::Nu6_2,
+        )],
+    };
+
+    let (runtime, _init_guard) = zebra_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, _handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version.clone())
+            .build();
+
+        // Prepare a banned IP map (not strictly required for remove(), but keeps
+        // the test's setup similar to real-world conditions).
+        let banned_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let mut bans_map: IndexMap<std::net::IpAddr, std::time::Instant> = IndexMap::new();
+        bans_map.insert(banned_ip, std::time::Instant::now());
+        let (_bans_tx, bans_rx) = watch::channel(Arc::new(bans_map));
+        peer_set.bans_receiver = bans_rx;
+
+        // Create a cancel handle as if a request was in-flight to `banned_addr`.
+        let banned_addr: PeerSocketAddr = SocketAddr::new(banned_ip, 1).into();
+        let (tx, _rx) =
+            crate::peer_set::set::oneshot::channel::<crate::peer_set::set::CancelClientWork>();
+        peer_set.cancel_handles.insert(banned_addr, tx);
+
+        // The peer is counted as 1 peer with that IP.
+        assert_eq!(peer_set.num_peers_with_ip(banned_ip), 1);
+
+        // Remove the peer (simulates a discovery::Remove or equivalent).
+        peer_set.remove(&banned_addr);
+
+        // After removal, the cancel handle should be gone and the count zero.
+        assert!(!peer_set.cancel_handles.contains_key(&banned_addr));
+        assert_eq!(peer_set.num_peers_with_ip(banned_ip), 0);
+    });
+}
+
 /// Check that a peer set routes inventory requests to a peer that has advertised that inventory.
 #[test]
 fn peer_set_route_inv_advertised_registry() {
@@ -315,7 +412,7 @@ fn peer_set_route_inv_advertised_registry_order(advertised_first: bool) {
     let test_change = InventoryStatus::new_available(test_inv, test_peer);
 
     // Use two peers with the same version
-    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
     let peer_versions = PeerVersions {
         peer_versions: vec![peer_version, peer_version],
     };
@@ -423,7 +520,7 @@ fn peer_set_route_inv_missing_registry_order(missing_first: bool) {
     let test_change = InventoryStatus::new_missing(test_inv, test_peer);
 
     // Use two peers with the same version
-    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
     let peer_versions = PeerVersions {
         peer_versions: vec![peer_version, peer_version],
     };
@@ -525,7 +622,7 @@ fn peer_set_route_inv_all_missing_fail() {
     let test_change = InventoryStatus::new_missing(test_inv, test_peer);
 
     // Use one peer
-    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
     let peer_versions = PeerVersions {
         peer_versions: vec![peer_version],
     };

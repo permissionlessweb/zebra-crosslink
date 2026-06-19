@@ -15,8 +15,6 @@ use zebra_network::address_book_peers::MockAddressBookPeers;
 use zebra_node_services::BoxError;
 use zebra_test::mock_service::MockService;
 
-use zebra_state::{Request, Response};
-
 use super::super::*;
 
 use config::rpc::Config;
@@ -39,11 +37,10 @@ async fn rpc_server_spawn() {
         debug_force_finished_sync: false,
         cookie_dir: Default::default(),
         enable_cookie_auth: false,
+        max_response_body_size: Default::default(),
     };
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let _state: MockService<Request, Response, _, BoxError> = MockService::build().for_unit_tests();
-    let crosslink: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut block_verifier_router: MockService<_, _, _, BoxError> =
@@ -59,7 +56,6 @@ async fn rpc_server_spawn() {
         "RPC test",
         "RPC test",
         Buffer::new(mempool.clone(), 1),
-        Buffer::new(crosslink.clone(), 1),
         Buffer::new(state.clone(), 1),
         Buffer::new(read_state.clone(), 1),
         Buffer::new(block_verifier_router.clone(), 1),
@@ -110,11 +106,11 @@ async fn rpc_spawn_unallocated_port(do_shutdown: bool) {
         debug_force_finished_sync: false,
         cookie_dir: Default::default(),
         enable_cookie_auth: false,
+        max_response_body_size: Default::default(),
     };
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let crosslink: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut block_verifier_router: MockService<_, _, _, BoxError> =
         MockService::build().for_unit_tests();
@@ -129,7 +125,6 @@ async fn rpc_spawn_unallocated_port(do_shutdown: bool) {
         "RPC test",
         "RPC test",
         Buffer::new(mempool.clone(), 1),
-        Buffer::new(crosslink.clone(), 1),
         Buffer::new(state.clone(), 1),
         Buffer::new(read_state.clone(), 1),
         Buffer::new(block_verifier_router.clone(), 1),
@@ -170,11 +165,11 @@ async fn rpc_server_spawn_port_conflict() {
         parallel_cpu_threads: 0,
         cookie_dir: Default::default(),
         enable_cookie_auth: false,
+        max_response_body_size: Default::default(),
     };
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let crosslink: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut block_verifier_router: MockService<_, _, _, BoxError> =
         MockService::build().for_unit_tests();
@@ -187,7 +182,6 @@ async fn rpc_server_spawn_port_conflict() {
         "RPC test",
         "RPC test",
         Buffer::new(mempool.clone(), 1),
-        Buffer::new(crosslink.clone(), 1),
         Buffer::new(state.clone(), 1),
         Buffer::new(read_state.clone(), 1),
         Buffer::new(block_verifier_router.clone(), 1),

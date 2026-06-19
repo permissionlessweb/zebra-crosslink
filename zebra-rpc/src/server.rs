@@ -12,22 +12,24 @@ use std::{fmt, panic};
 use cookie::Cookie;
 use jsonrpsee::server::{middleware::rpc::RpcServiceBuilder, Server, ServerHandle};
 use tokio::task::JoinHandle;
-use tower::Service;
 use tracing::*;
 
 use zebra_chain::{
-    block, chain_sync_status::ChainSyncStatus, chain_tip::ChainTip, parameters::Network,
+    block::MAX_BLOCK_BYTES, chain_sync_status::ChainSyncStatus, chain_tip::ChainTip,
+    parameters::Network,
 };
+use zebra_consensus::router::service_trait::BlockVerifierService;
 use zebra_network::AddressBookPeers;
-use zebra_node_services::mempool;
-use zebra_state::crosslink::{TFLServiceRequest, TFLServiceResponse};
+use zebra_node_services::mempool::MempoolService;
+use zebra_state::{ReadState as ReadStateService, State as StateService};
 
 use crate::{
     config,
     methods::{RpcImpl, RpcServer as _},
     server::{
         http_request_compatibility::HttpRequestMiddlewareLayer,
-        rpc_call_compatibility::FixRpcResponseMiddleware,
+        rpc_call_compatibility::FixRpcResponseMiddleware, rpc_metrics::RpcMetricsMiddleware,
+        rpc_tracing::RpcTracingMiddleware,
     },
 };
 
@@ -35,6 +37,8 @@ pub mod cookie;
 pub mod error;
 pub mod http_request_compatibility;
 pub mod rpc_call_compatibility;
+pub mod rpc_metrics;
+pub mod rpc_tracing;
 
 #[cfg(test)]
 mod tests;
@@ -93,7 +97,6 @@ impl RpcServer {
     #[allow(clippy::too_many_arguments)]
     pub async fn start<
         Mempool,
-        TFLService,
         State,
         ReadState,
         Tip,
@@ -101,91 +104,52 @@ impl RpcServer {
         SyncStatus,
         AddressBook,
     >(
-        rpc: RpcImpl<
-            Mempool,
-            TFLService,
-            State,
-            ReadState,
-            Tip,
-            AddressBook,
-            BlockVerifierRouter,
-            SyncStatus,
-        >,
+        rpc: RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>,
         conf: config::rpc::Config,
     ) -> Result<ServerTask, tower::BoxError>
     where
-        Mempool: tower::Service<
-                mempool::Request,
-                Response = mempool::Response,
-                Error = zebra_node_services::BoxError,
-            > + Clone
-            + Send
-            + Sync
-            + 'static,
-        Mempool::Future: Send,
-        TFLService: Service<
-                TFLServiceRequest,
-                Response = TFLServiceResponse,
-                Error = zebra_node_services::BoxError,
-            > + Clone
-            + Send
-            + Sync
-            + 'static,
-        TFLService::Future: Send,
-        State: Service<
-                zebra_state::Request,
-                Response = zebra_state::Response,
-                Error = zebra_state::BoxError,
-            > + Clone
-            + Send
-            + Sync
-            + 'static,
-        State::Future: Send,
-        ReadState: Service<
-                zebra_state::ReadRequest,
-                Response = zebra_state::ReadResponse,
-                Error = zebra_state::BoxError,
-            > + Clone
-            + Send
-            + Sync
-            + 'static,
-        ReadState::Future: Send,
+        Mempool: MempoolService,
+        State: StateService,
+        ReadState: ReadStateService,
         Tip: ChainTip + Clone + Send + Sync + 'static,
         AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
-        BlockVerifierRouter: Service<
-                zebra_consensus::Request,
-                Response = block::Hash,
-                Error = zebra_consensus::BoxError,
-            > + Clone
-            + Send
-            + Sync
-            + 'static,
-        <BlockVerifierRouter as Service<zebra_consensus::Request>>::Future: Send,
+        BlockVerifierRouter: BlockVerifierService,
         SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     {
         let listen_addr = conf
             .listen_addr
             .expect("caller should make sure listen_addr is set");
 
+        // The largest RPC request is submitblock, which sends a full block
+        // as a hex string (2x MAX_BLOCK_BYTES) plus a small JSON-RPC wrapper.
+        let max_request_body_size = (MAX_BLOCK_BYTES as usize) * 2 + 1024;
+
         let http_middleware_layer = if conf.enable_cookie_auth {
             let cookie = Cookie::default();
             cookie::write_to_disk(&cookie, &conf.cookie_dir)
                 .expect("Zebra must be able to write the auth cookie to the disk");
-            HttpRequestMiddlewareLayer::new(Some(cookie))
+            HttpRequestMiddlewareLayer::new(Some(cookie), max_request_body_size)
         } else {
-            HttpRequestMiddlewareLayer::new(None)
+            HttpRequestMiddlewareLayer::new(None, max_request_body_size)
         };
 
         let http_middleware = tower::ServiceBuilder::new().layer(http_middleware_layer);
 
         let rpc_middleware = RpcServiceBuilder::new()
             .rpc_logger(1024)
-            .layer_fn(FixRpcResponseMiddleware::new);
+            .layer_fn(FixRpcResponseMiddleware::new)
+            .layer_fn(RpcMetricsMiddleware::new)
+            .layer_fn(RpcTracingMiddleware::new);
 
         let server = Server::builder()
             .http_only()
             .set_http_middleware(http_middleware)
             .set_rpc_middleware(rpc_middleware)
+            .max_response_body_size(
+                conf.max_response_body_size
+                    .try_into()
+                    .expect("should be valid"),
+            )
             .build(listen_addr)
             .await?;
 

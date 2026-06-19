@@ -8,7 +8,7 @@ use crate::{
     fmt::{HexDebug, SummaryDebug},
     history_tree::HistoryTree,
     parameters::{NetworkUpgrade::*, GENESIS_PREVIOUS_BLOCK_HASH},
-    serialization,
+    serialization::{self, BytesInDisplayOrder},
     transaction::arbitrary::MAX_ARBITRARY_ITEMS,
     transparent::{
         new_transaction_ordered_outputs, CoinbaseSpendRestriction,
@@ -582,6 +582,31 @@ where
         + Copy
         + 'static,
 {
+    // Coinbase transactions must not contain Sapling spends (GHSA-rgwx-8r98-p34c).
+    // The arbitrary `Transaction` strategy generates these independently, so clear
+    // any generated Sapling shielded data on coinbase transactions before the chain
+    // builder commits them. The deserialization rejection path is still exercised
+    // by the `transaction_roundtrip` proptest and the GHSA-rgwx-8r98-p34c reproduction
+    // vector in `zebra-chain`.
+    if transaction.is_coinbase() {
+        match &mut transaction {
+            Transaction::V4 {
+                sapling_shielded_data,
+                ..
+            } => *sapling_shielded_data = None,
+            Transaction::V5 {
+                sapling_shielded_data,
+                ..
+            } => *sapling_shielded_data = None,
+            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+            Transaction::V6 {
+                sapling_shielded_data,
+                ..
+            } => *sapling_shielded_data = None,
+            Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {}
+        }
+    }
+
     let mut spend_restriction = transaction.coinbase_spend_restriction(&Network::Mainnet, height);
     let mut new_inputs = Vec::new();
     let mut spent_outputs = HashMap::new();
@@ -602,9 +627,7 @@ where
                 input.set_outpoint(selected_outpoint);
                 new_inputs.push(input);
 
-                let spent_utxo = utxos
-                    .remove(&selected_outpoint)
-                    .expect("selected outpoint must have a UTXO");
+                let spent_utxo = utxos.remove(&selected_outpoint)?;
                 spent_outputs.insert(selected_outpoint, spent_utxo.utxo.output);
             }
             // otherwise, drop the invalid input, because it has no valid UTXOs to spend
@@ -759,7 +782,6 @@ impl Arbitrary for Header {
                         difficulty_threshold,
                         nonce,
                         solution,
-                        fat_pointer_to_bft_block: FatPointerToBftBlock::null(),
                     }
                 },
             )

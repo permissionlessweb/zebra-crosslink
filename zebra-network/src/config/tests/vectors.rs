@@ -4,12 +4,8 @@ use static_assertions::const_assert;
 use zebra_chain::{
     block::Height,
     parameters::{
-        subsidy::{
-            FundingStreamReceiver, FundingStreamRecipient, FundingStreams, FUNDING_STREAMS_TESTNET,
-            FUNDING_STREAM_ECC_ADDRESSES_TESTNET, FUNDING_STREAM_MG_ADDRESSES_TESTNET,
-            FUNDING_STREAM_ZF_ADDRESSES_TESTNET, POST_NU6_FUNDING_STREAM_FPF_ADDRESSES_TESTNET,
-        },
-        testnet::{self, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams},
+        testnet::{self, ConfiguredFundingStreams},
+        Network,
     },
 };
 
@@ -67,7 +63,6 @@ fn ensure_peer_connection_limits_consistent() {
     );
 }
 
-#[ignore] // [ACTIVATION HEIGHT PROBLEM]
 #[test]
 fn testnet_params_serialization_roundtrip() {
     let _init_guard = zebra_test::init();
@@ -75,7 +70,8 @@ fn testnet_params_serialization_roundtrip() {
     let config = Config {
         network: testnet::Parameters::build()
             .with_disable_pow(true)
-            .to_network(),
+            .to_network()
+            .expect("failed to build configured network"),
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
@@ -95,52 +91,21 @@ fn default_config_uses_ipv6() {
     assert!(config.listen_addr.is_ipv6());
 }
 
-#[ignore] // [ACTIVATION HEIGHT PROBLEM]
 #[test]
 fn funding_streams_serialization_roundtrip() {
     let _init_guard = zebra_test::init();
 
-    let fs = vec![
-        ConfiguredFundingStreams::from(&FundingStreams::new(
-            Height(1_028_500)..Height(2_796_000),
-            vec![
-                (
-                    FundingStreamReceiver::Ecc,
-                    FundingStreamRecipient::new(7, FUNDING_STREAM_ECC_ADDRESSES_TESTNET),
-                ),
-                (
-                    FundingStreamReceiver::ZcashFoundation,
-                    FundingStreamRecipient::new(5, FUNDING_STREAM_ZF_ADDRESSES_TESTNET),
-                ),
-                (
-                    FundingStreamReceiver::MajorGrants,
-                    FundingStreamRecipient::new(8, FUNDING_STREAM_MG_ADDRESSES_TESTNET),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        )),
-        ConfiguredFundingStreams::from(&FundingStreams::new(
-            Height(2_976_000)..Height(2_796_000 + 420_000),
-            vec![
-                (
-                    FundingStreamReceiver::Deferred,
-                    FundingStreamRecipient::new::<[&str; 0], &str>(12, []),
-                ),
-                (
-                    FundingStreamReceiver::MajorGrants,
-                    FundingStreamRecipient::new(8, POST_NU6_FUNDING_STREAM_FPF_ADDRESSES_TESTNET),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        )),
-    ];
+    let fs = testnet::Parameters::default()
+        .funding_streams()
+        .iter()
+        .map(ConfiguredFundingStreams::from)
+        .collect();
 
     let config = Config {
         network: testnet::Parameters::build()
             .with_funding_streams(fs)
-            .to_network(),
+            .to_network()
+            .expect("failed to build configured network"),
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
@@ -151,74 +116,34 @@ fn funding_streams_serialization_roundtrip() {
     assert_eq!(config, deserialized);
 }
 
-#[ignore] // [ACTIVATION HEIGHT PROBLEM]
+/// Checks that a configured Testnet's temporary Orchard-disabling soft fork height
+/// survives a serialization round-trip.
 #[test]
-fn funding_streams_default_values() {
+fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
     let _init_guard = zebra_test::init();
 
-    let fs = vec![
-        ConfiguredFundingStreams {
-            height_range: Some(Height(1_028_500 - 1)..Height(2_796_000 - 1)),
-            // Will read from existing values
-            recipients: None,
-        },
-        ConfiguredFundingStreams {
-            // Will read from existing values
-            height_range: None,
-            recipients: Some(vec![
-                ConfiguredFundingStreamRecipient {
-                    receiver: FundingStreamReceiver::Deferred,
-                    numerator: 1,
-                    addresses: None,
-                },
-                ConfiguredFundingStreamRecipient {
-                    receiver: FundingStreamReceiver::MajorGrants,
-                    numerator: 2,
-                    addresses: Some(
-                        POST_NU6_FUNDING_STREAM_FPF_ADDRESSES_TESTNET
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                    ),
-                },
-            ]),
-        },
-    ];
+    let soft_fork_height = Height(2_000_000);
 
-    let network = testnet::Parameters::build()
-        .with_funding_streams(fs)
-        .to_network();
+    let config = Config {
+        network: testnet::Parameters::build()
+            .with_temporary_orchard_disabling_soft_fork_height(soft_fork_height)
+            .to_network()
+            .expect("failed to build configured network"),
+        initial_testnet_peers: [].into(),
+        ..Config::default()
+    };
 
-    // Check if value hasn't changed
+    let serialized = toml::to_string(&config).unwrap();
+    let deserialized: Config = toml::from_str(&serialized).unwrap();
+
+    assert_eq!(config, deserialized);
+
+    // The configured height must be preserved through the round-trip.
+    let Network::Testnet(params) = &deserialized.network else {
+        panic!("deserialized network must be a Testnet");
+    };
     assert_eq!(
-        network.all_funding_streams()[0].height_range().clone(),
-        Height(1_028_500 - 1)..Height(2_796_000 - 1)
-    );
-    // Check if value was copied from default
-    assert_eq!(
-        network.all_funding_streams()[0]
-            .recipients()
-            .get(&FundingStreamReceiver::ZcashFoundation)
-            .unwrap()
-            .addresses(),
-        FUNDING_STREAMS_TESTNET[0]
-            .recipients()
-            .get(&FundingStreamReceiver::ZcashFoundation)
-            .unwrap()
-            .addresses()
-    );
-    // Check if value was copied from default
-    assert_eq!(
-        network.all_funding_streams()[1].height_range(),
-        FUNDING_STREAMS_TESTNET[1].height_range()
-    );
-    // Check if value hasn't changed
-    assert_eq!(
-        network.all_funding_streams()[1]
-            .recipients()
-            .get(&FundingStreamReceiver::Deferred)
-            .unwrap()
-            .numerator(),
-        1
+        params.temporary_orchard_disabling_soft_fork_height(),
+        Some(soft_fork_height),
     );
 }

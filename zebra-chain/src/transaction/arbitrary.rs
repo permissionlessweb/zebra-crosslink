@@ -135,7 +135,7 @@ impl Transaction {
     /// Generate a proptest strategy for V5 Transactions
     pub fn v5_strategy(ledger_state: LedgerState) -> BoxedStrategy<Self> {
         (
-            NetworkUpgrade::branch_id_strategy(),
+            NetworkUpgrade::nu5_branch_id_strategy(),
             any::<LockTime>(),
             any::<block::Height>(),
             transparent::Input::vec_strategy(&ledger_state, MAX_ARBITRARY_ITEMS),
@@ -705,13 +705,31 @@ impl Arbitrary for orchard::ShieldedData {
             any::<orchard::shielded_data::Flags>(),
             any::<Amount>(),
             any::<orchard::tree::Root>(),
-            any::<Halo2Proof>(),
             vec(
                 any::<orchard::shielded_data::AuthorizedAction>(),
                 1..MAX_ARBITRARY_ITEMS,
             ),
             any::<BindingSignature>(),
         )
+            .prop_flat_map(
+                |(flags, value_balance, shared_anchor, actions, binding_sig)| {
+                    // Since NU6.2, an Orchard proof must have the canonical length for its number of
+                    // actions (`2272 * num_actions + 2720` bytes), otherwise it is rejected as
+                    // non-canonical (GHSA-jfw5-j458-pfv6). The V5 txid is computed by round-tripping
+                    // through `librustzcash`, which enforces this length, so a proof of any other
+                    // size makes the round-trip (and thus `Transaction::hash`) fail. Generate a proof
+                    // of exactly the expected length, which depends on the number of actions.
+                    let proof_size = orchard::shielded_data::expected_proof_size(actions.len());
+                    (
+                        Just(flags),
+                        Just(value_balance),
+                        Just(shared_anchor),
+                        vec(any::<u8>(), proof_size).prop_map(Halo2Proof),
+                        Just(actions),
+                        Just(binding_sig),
+                    )
+                },
+            )
             .prop_map(
                 |(flags, value_balance, shared_anchor, proof, actions, binding_sig)| Self {
                     flags,
@@ -781,6 +799,7 @@ impl Arbitrary for Transaction {
             NetworkUpgrade::Nu5
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
+            | NetworkUpgrade::Nu6_2
             | NetworkUpgrade::Nu7 => prop_oneof![
                 Self::v4_strategy(ledger_state.clone()),
                 Self::v5_strategy(ledger_state)
@@ -817,6 +836,7 @@ impl Arbitrary for VerifiedUnminedTx {
             any::<UnminedTx>(),
             any::<Amount<NonNegative>>(),
             any::<u32>(),
+            any::<u32>(),
             any::<(u16, u16)>().prop_map(|(unpaid_actions, conventional_actions)| {
                 (
                     unpaid_actions % conventional_actions.saturating_add(1),
@@ -832,6 +852,7 @@ impl Arbitrary for VerifiedUnminedTx {
                     transaction,
                     miner_fee,
                     sigops,
+                    p2sh_sigops,
                     (conventional_actions, mut unpaid_actions),
                     fee_weight_ratio,
                     time,
@@ -847,12 +868,14 @@ impl Arbitrary for VerifiedUnminedTx {
                     Self {
                         transaction,
                         miner_fee,
-                        sigops,
+                        legacy_sigop_count: sigops,
+                        p2sh_sigop_count: p2sh_sigops,
                         conventional_actions,
                         unpaid_actions,
                         fee_weight_ratio,
                         time: Some(time),
                         height: Some(height),
+                        spent_outputs: std::sync::Arc::new(vec![]),
                     }
                 },
             )
@@ -934,9 +957,8 @@ pub fn transaction_to_fake_v5(
             orchard_shielded_data: None,
         },
         v5 @ V5 { .. } => v5.clone(),
-        #[cfg(feature = "tx_v6")]
+        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
         v6 @ V6 { .. } => v6.clone(),
-        v6 @ VCrosslink { .. } => v6.clone(),
     }
 }
 
@@ -1021,9 +1043,8 @@ pub fn v5_transactions<'b>(
         | Transaction::V3 { .. }
         | Transaction::V4 { .. } => None,
         ref tx @ Transaction::V5 { .. } => Some(tx.clone()),
-        #[cfg(feature = "tx_v6")]
+        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
         ref tx @ Transaction::V6 { .. } => Some(tx.clone()),
-        ref tx @ Transaction::VCrosslink { .. } => Some(tx.clone()),
     })
 }
 

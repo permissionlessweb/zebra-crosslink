@@ -1,5 +1,7 @@
 //! Fixed test vectors for the syncer.
 
+#![allow(clippy::unwrap_in_result)]
+
 use std::{collections::HashMap, iter, sync::Arc, time::Duration};
 
 use color_eyre::Report;
@@ -10,8 +12,8 @@ use zebra_chain::{
     chain_tip::mock::{MockChainTip, MockChainTipSender},
     serialization::ZcashDeserializeInto,
 };
-use zebra_consensus::Config as ConsensusConfig;
-use zebra_network::InventoryResponse;
+use zebra_consensus::{Config as ConsensusConfig, RouterError, VerifyBlockError};
+use zebra_network::{InventoryResponse, PeerSocketAddr};
 use zebra_state::Config as StateConfig;
 use zebra_test::mock_service::{MockService, PanicAssertion};
 
@@ -20,7 +22,7 @@ use zebra_state as zs;
 
 use crate::{
     components::{
-        sync::{self, SyncStatus},
+        sync::{self, downloads::BlockDownloadVerifyError, SyncStatus},
         ChainSync,
     },
     config::ZebradConfig,
@@ -105,10 +107,7 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
     state_service
         .expect_request(zs::Request::KnownBlock(block0_hash))
         .await
-        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock {
-            location: zs::KnownBlockLocation::BestChain,
-            height: Height(0),
-        })));
+        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
 
     // ChainSync::obtain_tips
 
@@ -350,10 +349,7 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
     state_service
         .expect_request(zs::Request::KnownBlock(block0_hash))
         .await
-        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock {
-            location: zs::KnownBlockLocation::BestChain,
-            height: Height(0),
-        })));
+        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
 
     // ChainSync::obtain_tips
 
@@ -653,10 +649,7 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
     state_service
         .expect_request(zs::Request::KnownBlock(block0_hash))
         .await
-        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock {
-            location: zs::KnownBlockLocation::BestChain,
-            height: Height(0),
-        })));
+        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
 
     // ChainSync::obtain_tips
 
@@ -829,10 +822,7 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
     state_service
         .expect_request(zs::Request::KnownBlock(block0_hash))
         .await
-        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock {
-            location: zs::KnownBlockLocation::BestChain,
-            height: Height(0),
-        })));
+        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
 
     // ChainSync::obtain_tips
 
@@ -995,6 +985,160 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
     );
 
     Ok(())
+}
+
+/// Tests that a `BlockDownloadVerifyError::Invalid` wrapping a
+/// `CommitBlockError::Duplicate` error does NOT trigger a sync restart.
+#[tokio::test]
+async fn should_restart_sync_returns_false() {
+    let commit_error = zs::CommitBlockError::Duplicate {
+        hash_or_height: None,
+        location: zebra_state::KnownBlock::BestChain,
+    };
+
+    let verify_block_error = VerifyBlockError::Commit(commit_error);
+    let router_error = RouterError::Block {
+        source: Box::new(verify_block_error),
+    };
+
+    let err = BlockDownloadVerifyError::Invalid {
+        error: router_error,
+        height: block::Height(42),
+        hash: block::Hash::from([0xAA; 32]),
+        advertiser_addr: None,
+    };
+
+    let restart = ChainSync::<
+        MockService<zn::Request, zn::Response, PanicAssertion>,
+        MockService<zs::Request, zs::Response, PanicAssertion>,
+        MockService<zebra_consensus::Request, block::Hash, PanicAssertion>,
+        MockChainTip,
+    >::should_restart_sync(&err);
+    assert!(
+        !restart,
+        "duplicate commit block errors should NOT trigger sync restart"
+    );
+}
+
+/// Verifies fix for GHSA-gvjc-3w7c-92jx: `AboveLookaheadHeightLimit` now has
+/// an explicit match arm in `should_restart_sync` that returns `false`.
+#[tokio::test]
+async fn above_lookahead_does_not_restart_sync() {
+    let err = BlockDownloadVerifyError::AboveLookaheadHeightLimit {
+        height: block::Height(60_000),
+        hash: block::Hash::from([0xBB; 32]),
+        advertiser_addr: None,
+    };
+
+    let restart = ChainSync::<
+        MockService<zn::Request, zn::Response, PanicAssertion>,
+        MockService<zs::Request, zs::Response, PanicAssertion>,
+        MockService<zebra_consensus::Request, block::Hash, PanicAssertion>,
+        MockChainTip,
+    >::should_restart_sync(&err);
+
+    assert!(
+        !restart,
+        "AboveLookaheadHeightLimit should NOT trigger sync restart (GHSA-gvjc-3w7c-92jx fix)"
+    );
+}
+
+/// Verifies fix for GHSA-gvjc-3w7c-92jx: `AboveLookaheadHeightLimit` now
+/// carries `advertiser_addr` so the offending peer can be scored.
+#[tokio::test]
+async fn above_lookahead_has_peer_attribution() {
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let err = BlockDownloadVerifyError::AboveLookaheadHeightLimit {
+        height: block::Height(60_000),
+        hash: block::Hash::from([0xCC; 32]),
+        advertiser_addr: Some(addr),
+    };
+
+    let has_addr = match &err {
+        BlockDownloadVerifyError::AboveLookaheadHeightLimit {
+            advertiser_addr, ..
+        } => advertiser_addr.is_some(),
+        _ => false,
+    };
+
+    assert!(
+        has_addr,
+        "AboveLookaheadHeightLimit should carry advertiser_addr for peer scoring \
+         (GHSA-gvjc-3w7c-92jx fix)"
+    );
+}
+
+/// Verifies fix for GHSA-gvjc-3w7c-92jx: both height-limit errors now
+/// return `false` from `should_restart_sync` — symmetric handling.
+#[tokio::test]
+async fn both_height_limits_do_not_restart_sync() {
+    let below = BlockDownloadVerifyError::BehindTipHeightLimit {
+        height: block::Height(1),
+        hash: block::Hash::from([0xDD; 32]),
+    };
+
+    let above = BlockDownloadVerifyError::AboveLookaheadHeightLimit {
+        height: block::Height(60_000),
+        hash: block::Hash::from([0xEE; 32]),
+        advertiser_addr: None,
+    };
+
+    let restart_below = ChainSync::<
+        MockService<zn::Request, zn::Response, PanicAssertion>,
+        MockService<zs::Request, zs::Response, PanicAssertion>,
+        MockService<zebra_consensus::Request, block::Hash, PanicAssertion>,
+        MockChainTip,
+    >::should_restart_sync(&below);
+
+    let restart_above = ChainSync::<
+        MockService<zn::Request, zn::Response, PanicAssertion>,
+        MockService<zs::Request, zs::Response, PanicAssertion>,
+        MockService<zebra_consensus::Request, block::Hash, PanicAssertion>,
+        MockChainTip,
+    >::should_restart_sync(&above);
+
+    assert!(
+        !restart_below,
+        "BehindTipHeightLimit should NOT restart sync"
+    );
+    assert!(
+        !restart_above,
+        "AboveLookaheadHeightLimit should NOT restart sync (GHSA-gvjc-3w7c-92jx fix)"
+    );
+}
+
+/// Verifies fix for GHSA-rj6c-83wx-jxf2: `InvalidHeight` does not trigger
+/// sync restart and carries `advertiser_addr` for peer scoring.
+#[tokio::test]
+async fn invalid_height_does_not_restart_sync() {
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let err = BlockDownloadVerifyError::InvalidHeight {
+        hash: block::Hash::from([0xFF; 32]),
+        advertiser_addr: Some(addr),
+    };
+
+    let restart = ChainSync::<
+        MockService<zn::Request, zn::Response, PanicAssertion>,
+        MockService<zs::Request, zs::Response, PanicAssertion>,
+        MockService<zebra_consensus::Request, block::Hash, PanicAssertion>,
+        MockChainTip,
+    >::should_restart_sync(&err);
+
+    assert!(
+        !restart,
+        "InvalidHeight should NOT trigger sync restart (GHSA-rj6c-83wx-jxf2 fix)"
+    );
+
+    let has_addr = match &err {
+        BlockDownloadVerifyError::InvalidHeight {
+            advertiser_addr, ..
+        } => advertiser_addr.is_some(),
+        _ => false,
+    };
+    assert!(
+        has_addr,
+        "InvalidHeight should carry advertiser_addr for peer scoring"
+    );
 }
 
 fn setup() -> (

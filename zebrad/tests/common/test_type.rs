@@ -225,7 +225,7 @@ impl TestType {
             // This is what we recommend our users configure.
             random_known_rpc_port_config(true, network)
         } else {
-            default_test_config(network)
+            Ok(default_test_config(network))
         };
 
         let mut config = match config {
@@ -312,6 +312,18 @@ impl TestType {
                     "running {test_name:?} {self:?} lightwalletd test without cached state (no default found)",
                 );
                 None
+            }
+        } else if self.can_create_lightwalletd_cached_state() {
+            // Ensure the directory exists so FullSyncFromGenesis can populate it.
+            if let Err(error) = std::fs::create_dir_all(&default_path) {
+                tracing::warn!(
+                    ?default_path,
+                    ?error,
+                    "failed to create default lightwalletd cache directory; using an ephemeral temp dir instead",
+                );
+                None
+            } else {
+                Some(default_path)
             }
         } else {
             None

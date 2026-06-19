@@ -1,5 +1,7 @@
 //! Inbound service tests with a fake peer set.
 
+#![allow(clippy::unwrap_in_result)]
+
 use std::{collections::HashSet, iter, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use futures::FutureExt;
@@ -169,6 +171,8 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
                 transaction,
                 Amount::try_from(1_000_000).expect("valid amount"),
                 0,
+                0,
+                std::sync::Arc::new(vec![]),
             )
             .expect("verification should pass"),
         ));
@@ -202,7 +206,7 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
     let mut hs = HashSet::new();
     hs.insert(tx.unmined_id());
     peer_set
-        .expect_request(Request::AdvertiseTransactionIds(hs))
+        .expect_request(Request::AdvertiseTransactionIds(hs, None))
         .await
         .respond(Response::Nil);
 
@@ -251,7 +255,7 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
     // Test `Request::AdvertiseTransactionIds`
     let request = inbound_service
         .clone()
-        .oneshot(Request::AdvertiseTransactionIds(txs.clone()));
+        .oneshot(Request::AdvertiseTransactionIds(txs.clone(), None));
     // Ensure the mocked peer set responds
     let peer_set_responder =
         peer_set
@@ -277,6 +281,8 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
                 transaction,
                 Amount::try_from(1_000_000).expect("valid amount"),
                 0,
+                0,
+                std::sync::Arc::new(vec![]),
             )
             .expect("verification should pass"),
         ));
@@ -310,7 +316,7 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
     let mut hs = HashSet::new();
     hs.insert(test_transaction.unmined_id());
     peer_set
-        .expect_request(Request::AdvertiseTransactionIds(hs))
+        .expect_request(Request::AdvertiseTransactionIds(hs, None))
         .await
         .respond(Response::Nil);
 
@@ -379,6 +385,8 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
                 transaction,
                 Amount::try_from(1_000_000).expect("valid amount"),
                 0,
+                0,
+                std::sync::Arc::new(vec![]),
             )
             .expect("verification should pass"),
         ));
@@ -426,8 +434,8 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     // Transaction and Block IDs are gossipped, in any order, after waiting for the gossip delay
     tokio::time::sleep(PEER_GOSSIP_DELAY).await;
     let possible_requests = &mut [
-        Request::AdvertiseTransactionIds(hs),
-        Request::AdvertiseBlock(block_two.hash()),
+        Request::AdvertiseTransactionIds(hs, None),
+        Request::AdvertiseBlock(block_two.hash(), None),
     ]
     .to_vec();
 
@@ -495,7 +503,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     // Test the block is gossiped, after waiting for the multi-gossip delay
     tokio::time::sleep(PEER_GOSSIP_DELAY).await;
     peer_set
-        .expect_request(Request::AdvertiseBlock(block_three.hash()))
+        .expect_request(Request::AdvertiseBlock(block_three.hash(), None))
         .await
         .respond(Response::Nil);
 
@@ -518,6 +526,8 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
                 transaction,
                 Amount::try_from(1_000_000).expect("valid amount"),
                 0,
+                0,
+                std::sync::Arc::new(vec![]),
             )
             .expect("verification should pass"),
         ));
@@ -575,7 +585,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     let mut hs = HashSet::new();
     hs.insert(tx2_id);
     peer_set
-        .expect_request(Request::AdvertiseTransactionIds(hs))
+        .expect_request(Request::AdvertiseTransactionIds(hs, None))
         .await
         .respond(Response::Nil);
 
@@ -603,7 +613,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         // Test the block is gossiped, after waiting for the multi-gossip delay
         tokio::time::sleep(PEER_GOSSIP_DELAY).await;
         peer_set
-            .expect_request(Request::AdvertiseBlock(block.hash()))
+            .expect_request(Request::AdvertiseBlock(block.hash(), None))
             .await
             .respond(Response::Nil);
 
@@ -671,7 +681,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     // Push test block hash
     let _request = inbound_service
         .clone()
-        .oneshot(Request::AdvertiseBlock(block_hash))
+        .oneshot(Request::AdvertiseBlock(block_hash, None))
         .await?;
 
     // Block is fetched, and committed to the state
@@ -707,7 +717,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     // Push test block hash
     let _request = inbound_service
         .clone()
-        .oneshot(Request::AdvertiseBlock(block_hash))
+        .oneshot(Request::AdvertiseBlock(block_hash, None))
         .await?;
 
     // Block is fetched, but the downloader drops it because it is too high
@@ -779,7 +789,7 @@ async fn caches_getaddr_response() {
 
         // UTXO verification doesn't matter for these tests.
         let (state, _read_only_state_service, latest_chain_tip, _chain_tip_change) =
-            zebra_state::init(state_config.clone(), &network, Height::MAX, 0);
+            zebra_state::init(state_config.clone(), &network, Height::MAX, 0).await;
 
         let state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -893,7 +903,7 @@ async fn setup(
 
     // UTXO verification doesn't matter for these tests.
     let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change) =
-        zebra_state::init(state_config.clone(), &network, Height::MAX, 0);
+        zebra_state::init(state_config.clone(), &network, Height::MAX, 0).await;
 
     let mut state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -1002,8 +1012,10 @@ async fn setup(
     //
     // (The genesis block gets skipped, because block 1 is committed before the task is spawned.)
     for block in committed_blocks.iter().skip(1) {
+        tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+
         peer_set
-            .expect_request(Request::AdvertiseBlock(block.hash()))
+            .expect_request(Request::AdvertiseBlock(block.hash(), None))
             .await
             .respond(Response::Nil);
     }
@@ -1067,17 +1079,17 @@ fn add_some_stuff_to_mempool(
     mempool_service: &mut Mempool,
     network: Network,
 ) -> Vec<VerifiedUnminedTx> {
-    // get the genesis block coinbase transaction from the Zcash blockchain.
-    let genesis_transactions: Vec<_> = network
-        .unmined_transactions_in_blocks(..=0)
-        .take(1)
-        .collect();
-
-    // Insert the genesis block coinbase transaction into the mempool storage.
-    mempool_service
-        .storage()
-        .insert(genesis_transactions[0].clone(), Vec::new(), None)
+    // get the last transaction from the Zcash blockchain.
+    let last_transaction = network
+        .unmined_transactions_in_blocks(..=10)
+        .last()
         .unwrap();
 
-    genesis_transactions
+    // Insert the last transaction into the mempool storage.
+    mempool_service
+        .storage()
+        .insert(last_transaction.clone(), Vec::new(), None)
+        .unwrap();
+
+    vec![last_transaction]
 }

@@ -1,38 +1,16 @@
 [book]
-authors = [
-  "Shielded Labs <https://shieldedlabs.net>",
-  # Note the following are primary authors of the `cl2-*.md` files which were copied and pasted from the `tfl-book` without their prior knowledge. They have not reviewed this book and do not necessarily endorse its content or design changes relative to Crosslink 2.
-  "Daira-Emma Hopwood",
-  "Jack Grigg",
-]
-
+authors = ["Zcash Foundation <zebra@zfnd.org>"]
 language = "en"
-multilingual = false
 src = "src"
-title = "The Zebra Crosslink Book"
+title = "The Zebra Book"
 
 [preprocessor]
 
-[preprocessor.katex]
-macros = "macros.txt"
-renderer = ["html"]
-# This is needed in order for \href and \url links to work.
-trust = true
-# Left-aligned displaymath
-fleqn = true
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
 
-# TODO: Enable this and fix all issues!
-# [output.linkcheck]
+[output]
 
 [output.html]
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
 additional-css = ["theme/css/custom.css"]
-
-[preprocessor.graphviz]
-command = "mdbook-graphviz"
-after = ["links"]
-output-to-file = true
-
-[preprocessor.admonish]
-command = "mdbook-admonish"
-assets_version = "3.0.0" # do not edit: managed by `mdbook-admonish install`
-on_failure = "bail"

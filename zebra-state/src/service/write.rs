@@ -1,6 +1,9 @@
 //! Writing blocks to the finalized and non-finalized states.
 
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use indexmap::IndexMap;
 use tokio::sync::{
@@ -9,10 +12,7 @@ use tokio::sync::{
 };
 
 use tracing::Span;
-use zebra_chain::{
-    block::{self, Height},
-    transparent::EXTRA_ZEBRA_COINBASE_DATA,
-};
+use zebra_chain::block::{self, Height};
 
 use crate::{
     constants::MAX_BLOCK_REORG_HEIGHT,
@@ -21,9 +21,9 @@ use crate::{
         finalized_state::{FinalizedState, ZebraDb},
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
-        BoxError, ChainTipBlock, ChainTipSender,
+        BoxError, ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
-    CommitSemanticallyVerifiedError, SemanticallyVerifiedBlock,
+    SemanticallyVerifiedBlock, ValidateContextError,
 };
 
 // These types are used in doc links
@@ -53,7 +53,7 @@ pub(crate) fn validate_and_commit_non_finalized(
     finalized_state: &ZebraDb,
     non_finalized_state: &mut NonFinalizedState,
     prepared: SemanticallyVerifiedBlock,
-) -> Result<(), CommitSemanticallyVerifiedError> {
+) -> Result<(), ValidateContextError> {
     check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared)?;
     let parent_hash = prepared.block.header.previous_block_hash;
 
@@ -72,6 +72,9 @@ pub(crate) fn validate_and_commit_non_finalized(
 ///
 /// `last_zebra_mined_log_height` is used to rate-limit logging.
 ///
+/// If `backup_dir_path` is `Some`, the non-finalized state is written to the backup
+/// directory before updating the channels.
+///
 /// Returns the latest non-finalized chain tip height.
 ///
 /// # Panics
@@ -83,7 +86,7 @@ pub(crate) fn validate_and_commit_non_finalized(
         non_finalized_state,
         chain_tip_sender,
         non_finalized_state_sender,
-        last_zebra_mined_log_height
+        backup_dir_path,
     ),
     fields(chains = non_finalized_state.chain_count())
 )]
@@ -91,7 +94,7 @@ fn update_latest_chain_channels(
     non_finalized_state: &NonFinalizedState,
     chain_tip_sender: &mut ChainTipSender,
     non_finalized_state_sender: &watch::Sender<NonFinalizedState>,
-    last_zebra_mined_log_height: &mut Option<Height>,
+    backup_dir_path: Option<&Path>,
 ) -> block::Height {
     let best_chain = non_finalized_state.best_chain().expect("unexpected empty non-finalized state: must commit at least one block before updating channels");
 
@@ -101,9 +104,11 @@ fn update_latest_chain_channels(
         .clone();
     let tip_block = ChainTipBlock::from(tip_block);
 
-    log_if_mined_by_zebra(&tip_block, last_zebra_mined_log_height);
-
     let tip_block_height = tip_block.height;
+
+    if let Some(backup_dir_path) = backup_dir_path {
+        non_finalized_state.write_to_backup(backup_dir_path);
+    }
 
     // If the final receiver was just dropped, ignore the error.
     let _ = non_finalized_state_sender.send(non_finalized_state.clone());
@@ -121,8 +126,19 @@ struct WriteBlockWorkerTask {
     finalized_state: FinalizedState,
     non_finalized_state: NonFinalizedState,
     invalid_block_reset_sender: UnboundedSender<block::Hash>,
+    /// Signals the [`crate::service::StateService`] that a non-finalized block was rejected by
+    /// the write task, so its hash should be removed from
+    /// `non_finalized_block_write_sent_hashes`.
+    ///
+    /// Without this, a rejected same-hash block locks out a later honest
+    /// re-delivery of a block at the same hash as a "duplicate" until restart
+    /// or reorg.
+    non_finalized_rejected_sender: UnboundedSender<block::Hash>,
     chain_tip_sender: ChainTipSender,
     non_finalized_state_sender: watch::Sender<NonFinalizedState>,
+    /// If `Some`, the non-finalized state is written to this backup directory
+    /// synchronously before each channel update, instead of via the async backup task.
+    backup_dir_path: Option<PathBuf>,
 }
 
 /// The message type for the non-finalized block write task channel.
@@ -138,13 +154,13 @@ pub enum NonFinalizedWriteMessage {
     /// the non-finalized state, if present.
     Invalidate {
         hash: block::Hash,
-        rsp_tx: oneshot::Sender<Result<block::Hash, BoxError>>,
+        rsp_tx: oneshot::Sender<Result<block::Hash, InvalidateError>>,
     },
     /// The hash of a block that was previously invalidated but should be
     /// reconsidered and reinserted into the non-finalized state.
     Reconsider {
         hash: block::Hash,
-        rsp_tx: oneshot::Sender<Result<Vec<block::Hash>, BoxError>>,
+        rsp_tx: oneshot::Sender<Result<Vec<block::Hash>, ReconsiderError>>,
     },
 }
 
@@ -185,8 +201,11 @@ impl BlockWriteSender {
         non_finalized_state: NonFinalizedState,
         chain_tip_sender: ChainTipSender,
         non_finalized_state_sender: watch::Sender<NonFinalizedState>,
+        should_use_finalized_block_write_sender: bool,
+        backup_dir_path: Option<PathBuf>,
     ) -> (
         Self,
+        tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         Option<Arc<std::thread::JoinHandle<()>>>,
     ) {
@@ -198,6 +217,8 @@ impl BlockWriteSender {
             tokio::sync::mpsc::unbounded_channel();
         let (invalid_block_reset_sender, invalid_block_write_reset_receiver) =
             tokio::sync::mpsc::unbounded_channel();
+        let (non_finalized_rejected_sender, non_finalized_rejected_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
 
         let span = Span::current();
         let task = std::thread::spawn(move || {
@@ -208,8 +229,10 @@ impl BlockWriteSender {
                     finalized_state,
                     non_finalized_state,
                     invalid_block_reset_sender,
+                    non_finalized_rejected_sender,
                     chain_tip_sender,
                     non_finalized_state_sender,
+                    backup_dir_path,
                 }
                 .run()
             })
@@ -218,9 +241,11 @@ impl BlockWriteSender {
         (
             Self {
                 non_finalized: Some(non_finalized_block_write_sender),
-                finalized: Some(finalized_block_write_sender),
+                finalized: should_use_finalized_block_write_sender
+                    .then_some(finalized_block_write_sender),
             },
             invalid_block_write_reset_receiver,
+            non_finalized_rejected_receiver,
             Some(Arc::new(task)),
         )
     }
@@ -244,11 +269,12 @@ impl WriteBlockWorkerTask {
             finalized_state,
             non_finalized_state,
             invalid_block_reset_sender,
+            non_finalized_rejected_sender,
             chain_tip_sender,
             non_finalized_state_sender,
+            backup_dir_path,
         } = &mut self;
 
-        let mut last_zebra_mined_log_height = None;
         let mut prev_finalized_note_commitment_trees = None;
 
         // Write all the finalized blocks sent by the state,
@@ -294,9 +320,6 @@ impl WriteBlockWorkerTask {
                 Ok((finalized, note_commitment_trees)) => {
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
-
-                    log_if_mined_by_zebra(&tip_block, &mut last_zebra_mined_log_height);
-
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
                 Err(error) => {
@@ -333,8 +356,7 @@ impl WriteBlockWorkerTask {
         }
 
         // Save any errors to propagate down to queued child blocks
-        let mut parent_error_map: IndexMap<block::Hash, CommitSemanticallyVerifiedError> =
-            IndexMap::new();
+        let mut parent_error_map: IndexMap<block::Hash, ValidateContextError> = IndexMap::new();
 
         while let Some(msg) = non_finalized_block_write_receiver.blocking_recv() {
             let queued_child_and_rsp_tx = match msg {
@@ -347,7 +369,7 @@ impl WriteBlockWorkerTask {
                             &non_finalized_state,
                             chain_tip_sender,
                             &non_finalized_state_sender,
-                            &mut last_zebra_mined_log_height,
+                            backup_dir_path.as_deref(),
                         );
 
                         info!("finalized {}, which implicitly finalizes:", hash);
@@ -391,11 +413,8 @@ impl WriteBlockWorkerTask {
                 }
                 NonFinalizedWriteMessage::Reconsider { hash, rsp_tx } => {
                     tracing::info!(?hash, "reconsidering a block in the non-finalized state");
-                    let _ = rsp_tx.send(
-                        non_finalized_state
-                            .reconsider_block(hash, &finalized_state.db)
-                            .map_err(BoxError::from),
-                    );
+                    let _ = rsp_tx
+                        .send(non_finalized_state.reconsider_block(hash, &finalized_state.db));
                     None
                 }
             };
@@ -405,7 +424,7 @@ impl WriteBlockWorkerTask {
                     non_finalized_state,
                     chain_tip_sender,
                     non_finalized_state_sender,
-                    &mut last_zebra_mined_log_height,
+                    backup_dir_path.as_deref(),
                 );
                 continue;
             };
@@ -414,32 +433,27 @@ impl WriteBlockWorkerTask {
             let parent_hash = queued_child.block.header.previous_block_hash;
             let parent_error = parent_error_map.get(&parent_hash);
 
-            let result;
-
             // If the parent block was marked as rejected, also reject all its children.
             //
             // At this point, we know that all the block's descendants
             // are invalid, because we checked all the consensus rules before
             // committing the failing ancestor block to the non-finalized state.
-            if let Some(parent_error) = parent_error {
-                result = Err(parent_error.clone());
+            let result = if let Some(parent_error) = parent_error {
+                Err(parent_error.clone())
             } else {
                 tracing::trace!(?child_hash, "validating queued child");
-                result = validate_and_commit_non_finalized(
+                validate_and_commit_non_finalized(
                     &finalized_state.db,
                     non_finalized_state,
                     queued_child,
                 )
-            }
+            };
 
             // TODO: fix the test timing bugs that require the result to be sent
             //       after `update_latest_chain_channels()`,
             //       and send the result on rsp_tx here
 
             if let Err(ref error) = result {
-                // Update the caller with the error.
-                let _ = rsp_tx.send(result.clone().map(|()| child_hash));
-
                 // If the block is invalid, mark any descendant blocks as rejected.
                 parent_error_map.insert(child_hash, error.clone());
 
@@ -448,6 +462,20 @@ impl WriteBlockWorkerTask {
                     // We only add one hash at a time, so we only need to remove one extra here.
                     parent_error_map.shift_remove_index(0);
                 }
+
+                // Signal the StateService to drop this hash from
+                // `non_finalized_block_write_sent_hashes`, so a subsequent
+                // re-delivery of a block at the same hash is not short-circuited
+                // as a "duplicate" against a rejected variant that never reached
+                // any chain.
+                //
+                // If the receiver was dropped (the StateService is shutting
+                // down), ignore the error: the lockout cannot matter once the
+                // service exits.
+                let _ = non_finalized_rejected_sender.send(child_hash);
+
+                // Update the caller with the error.
+                let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
 
                 // Skip the things we only need to do for successfully committed blocks
                 continue;
@@ -463,11 +491,11 @@ impl WriteBlockWorkerTask {
                 non_finalized_state,
                 chain_tip_sender,
                 non_finalized_state_sender,
-                &mut last_zebra_mined_log_height,
+                backup_dir_path.as_deref(),
             );
 
             // Update the caller with the result.
-            let _ = rsp_tx.send(result.clone().map(|()| child_hash));
+            let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
 
             while non_finalized_state
                 .best_chain_len()
@@ -504,74 +532,5 @@ impl WriteBlockWorkerTask {
         // done writing to the finalized state, so we can force it to shut down.
         finalized_state.db.shutdown(true);
         std::mem::drop(self.finalized_state);
-    }
-}
-
-/// Log a message if this block was mined by Zebra.
-///
-/// Does not detect early Zebra blocks, and blocks with custom coinbase transactions.
-/// Rate-limited to every 1000 blocks using `last_zebra_mined_log_height`.
-fn log_if_mined_by_zebra(
-    tip_block: &ChainTipBlock,
-    last_zebra_mined_log_height: &mut Option<Height>,
-) {
-    // This logs at most every 2-3 checkpoints, which seems fine.
-    const LOG_RATE_LIMIT: u32 = 1000;
-
-    let height = tip_block.height.0;
-
-    if let Some(last_height) = last_zebra_mined_log_height {
-        if height < last_height.0 + LOG_RATE_LIMIT {
-            // If we logged in the last 1000 blocks, don't log anything now.
-            return;
-        }
-    };
-
-    // This code is rate-limited, so we can do expensive transformations here.
-    let coinbase_data = tip_block.transactions[0].inputs()[0]
-        .extra_coinbase_data()
-        .expect("valid blocks must start with a coinbase input")
-        .clone();
-
-    if coinbase_data
-        .as_ref()
-        .starts_with(EXTRA_ZEBRA_COINBASE_DATA.as_bytes())
-    {
-        let text = String::from_utf8_lossy(coinbase_data.as_ref());
-
-        *last_zebra_mined_log_height = Some(Height(height));
-
-        // No need for hex-encoded data if it's exactly what we expected.
-        if coinbase_data.as_ref() == EXTRA_ZEBRA_COINBASE_DATA.as_bytes() {
-            info!(
-                %text,
-                %height,
-                hash = %tip_block.hash,
-                "looks like this block was mined by Zebra!"
-            );
-        } else {
-            // # Security
-            //
-            // Use the extra data as an allow-list, replacing unknown characters.
-            // This makes sure control characters and harmful messages don't get logged
-            // to the terminal.
-            let text = text.replace(
-                |c: char| {
-                    !EXTRA_ZEBRA_COINBASE_DATA
-                        .to_ascii_lowercase()
-                        .contains(c.to_ascii_lowercase())
-                },
-                "?",
-            );
-            let data = hex::encode(coinbase_data.as_ref());
-
-            info!(
-                %text,
-                %data,
-                %height,
-                hash = %tip_block.hash,
-                "looks like this block was mined by Zebra!"
-            );
-        }
     }
 }

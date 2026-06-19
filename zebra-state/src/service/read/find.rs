@@ -27,6 +27,7 @@ use zebra_chain::{
 
 use crate::{
     constants,
+    response::KnownBlockLocation,
     service::{
         block_iter::any_ancestor_blocks,
         check::{difficulty::POW_MEDIAN_BLOCK_SPAN, AdjustedDifficulty},
@@ -34,7 +35,7 @@ use crate::{
         non_finalized_state::{Chain, NonFinalizedState},
         read::{self, block::block_header, FINALIZED_STATE_QUERY_RETRIES},
     },
-    BoxError, KnownBlock, KnownBlockLocation,
+    BoxError, KnownBlock,
 };
 
 #[cfg(test)]
@@ -63,6 +64,23 @@ where
     chain
         .map(|chain| chain.as_ref().non_finalized_tip())
         .or_else(|| db.tip())
+}
+
+/// Returns the tip block of `chain`.
+/// If there is no chain, returns the tip of `db`.
+pub fn tip_block<C>(chain: Option<C>, db: &ZebraDb) -> Option<Arc<Block>>
+where
+    C: AsRef<Chain>,
+{
+    // # Correctness
+    //
+    // If there is an overlap between the non-finalized and finalized states,
+    // where the finalized tip is above the non-finalized tip,
+    // Zebra is receiving a lot of blocks, or this request has been delayed for a long time,
+    // so it is acceptable to return either tip.
+    chain
+        .and_then(|chain| chain.as_ref().tip_block().map(|b| b.block.clone()))
+        .or_else(|| db.tip_block())
 }
 
 /// Returns the tip [`Height`] of `chain`.
@@ -144,6 +162,7 @@ pub fn non_finalized_state_contains_block_hash(
     hash: block::Hash,
 ) -> Option<KnownBlock> {
     let mut chains_iter = non_finalized_state.chain_iter();
+    let is_hash_in_chain = |chain: &Arc<Chain>| chain.contains_block_hash(hash);
 
     // Equivalent to `chain_set.iter().next_back()` in `NonFinalizedState.best_chain()` method.
     if let Some(best_chain) = chains_iter.next() {

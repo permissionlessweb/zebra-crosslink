@@ -177,7 +177,7 @@ pub struct ChainInner {
     pub(crate) sapling_anchors_by_height: BTreeMap<block::Height, sapling::tree::Root>,
     /// A list of Sapling subtrees completed in the non-finalized state
     pub(crate) sapling_subtrees:
-        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling::tree::Node>>,
+        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>>,
 
     /// The Orchard anchors created by `blocks`.
     ///
@@ -750,7 +750,7 @@ impl Chain {
     pub fn sapling_subtree(
         &self,
         hash_or_height: HashOrHeight,
-    ) -> Option<NoteCommitmentSubtree<sapling::tree::Node>> {
+    ) -> Option<NoteCommitmentSubtree<sapling_crypto::Node>> {
         let height =
             hash_or_height.height_or_else(|hash| self.height_by_hash.get(&hash).cloned())?;
 
@@ -771,7 +771,7 @@ impl Chain {
     pub fn sapling_subtrees_in_range(
         &self,
         range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex>,
-    ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling::tree::Node>> {
+    ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>> {
         self.sapling_subtrees
             .range(range)
             .map(|(index, subtree)| (*index, *subtree))
@@ -779,7 +779,7 @@ impl Chain {
     }
 
     /// Returns the Sapling [`NoteCommitmentSubtree`] if it was completed at the tip height.
-    pub fn sapling_subtree_for_tip(&self) -> Option<NoteCommitmentSubtree<sapling::tree::Node>> {
+    pub fn sapling_subtree_for_tip(&self) -> Option<NoteCommitmentSubtree<sapling_crypto::Node>> {
         if !self.is_empty() {
             let tip = self.non_finalized_tip_height();
             self.sapling_subtree(tip.into())
@@ -1240,6 +1240,25 @@ impl Chain {
             .remove(&block_height)
             .expect("only called while blocks is populated");
 
+        // If the popped block completed a Sapling or Orchard subtree, remove the corresponding
+        // subtree from this chain too. Subtrees are inserted by `push` keyed by the highest subtree
+        // index, so the last entry's `end_height` matches the popped block iff a subtree was
+        // completed at that height.
+        if self
+            .sapling_subtrees
+            .last_key_value()
+            .is_some_and(|(_, subtree)| subtree.end_height == block_height)
+        {
+            self.sapling_subtrees.pop_last();
+        }
+        if self
+            .orchard_subtrees
+            .last_key_value()
+            .is_some_and(|(_, subtree)| subtree.end_height == block_height)
+        {
+            self.orchard_subtrees.pop_last();
+        }
+
         assert!(
             !self.blocks.is_empty(),
             "Non-finalized chains must have at least one block to be valid"
@@ -1590,7 +1609,7 @@ impl Chain {
                     sapling_shielded_data,
                     orchard_shielded_data,
                 ),
-                #[cfg(feature="tx_v6")]
+                #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
                 V6 {
                     inputs,
                     outputs,
@@ -1611,6 +1630,29 @@ impl Chain {
                 ),
             };
 
+            // Shielded-data updates run before the transparent updates and
+            // the `tx_loc_by_hash` insert so that a duplicate transaction
+            // (same hash → same nullifiers) is rejected with a clean
+            // `Duplicate{Sprout|Sapling|Orchard}Nullifier` error by
+            // `add_to_non_finalized_chain_unique` before reaching the
+            // defense-in-depth assertions on `tx_loc_by_hash`,
+            // `created_utxos`, and `spent_utxos` below.
+            {
+                #[cfg(not(feature = "indexer"))]
+                let transaction_hash = ();
+
+                self.update_chain_tip_with(&(joinsplit_data, &transaction_hash))?;
+                self.update_chain_tip_with(&(
+                    sapling_shielded_data_per_spend_anchor,
+                    &transaction_hash,
+                ))?;
+                self.update_chain_tip_with(&(
+                    sapling_shielded_data_shared_anchor,
+                    &transaction_hash,
+                ))?;
+                self.update_chain_tip_with(&(orchard_shielded_data, &transaction_hash))?;
+            }
+
             // add key `transaction.hash` and value `(height, tx_index)` to `tx_loc_by_hash`
             let transaction_location = TransactionLocation::from_usize(height, transaction_index);
             let prior_pair = self
@@ -1625,19 +1667,6 @@ impl Chain {
             self.update_chain_tip_with(&(outputs, &transaction_hash, new_outputs))?;
             // delete the utxos this consumed
             self.update_chain_tip_with(&(inputs, &transaction_hash, spent_outputs))?;
-
-            // add the shielded data
-
-            #[cfg(not(feature = "indexer"))]
-            let transaction_hash = ();
-
-            self.update_chain_tip_with(&(joinsplit_data, &transaction_hash))?;
-            self.update_chain_tip_with(&(
-                sapling_shielded_data_per_spend_anchor,
-                &transaction_hash,
-            ))?;
-            self.update_chain_tip_with(&(sapling_shielded_data_shared_anchor, &transaction_hash))?;
-            self.update_chain_tip_with(&(orchard_shielded_data, &transaction_hash))?;
         }
 
         // update the chain value pool balances
@@ -1781,7 +1810,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     sapling_shielded_data,
                     orchard_shielded_data,
                 ),
-                #[cfg(feature="tx_v6")]
+                #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
                 V6 {
                     inputs,
                     outputs,
@@ -2239,8 +2268,8 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
             }
             Err(value_balance_error) => Err(ValidateContextError::AddValuePool {
                 value_balance_error,
-                chain_value_pools: self.chain_value_pools,
-                block_value_pool_change: *block_value_pool_change,
+                chain_value_pools: Box::new(self.chain_value_pools),
+                block_value_pool_change: Box::new(*block_value_pool_change),
                 height: Some(*height),
             })?,
         };
@@ -2387,7 +2416,7 @@ impl Chain {
     /// Inserts the supplied Sapling note commitment subtree into the chain.
     pub(crate) fn insert_sapling_subtree(
         &mut self,
-        subtree: NoteCommitmentSubtree<sapling::tree::Node>,
+        subtree: NoteCommitmentSubtree<sapling_crypto::Node>,
     ) {
         self.inner
             .sapling_subtrees

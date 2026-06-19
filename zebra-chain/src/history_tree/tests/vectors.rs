@@ -21,7 +21,6 @@ use eyre::Result;
 /// zebra-chain/src/primitives/zcash_history/tests/vectors.rs, but with the
 /// higher level API.
 #[test]
-#[ignore] // [ACTIVATION HEIGHT PROBLEM]
 fn push_and_prune() -> Result<()> {
     for network in Network::iter() {
         push_and_prune_for_network_upgrade(network.clone(), NetworkUpgrade::Heartwood)?;
@@ -95,7 +94,7 @@ fn push_and_prune_for_network_upgrade(
     tree.push(second_block, &second_sapling_root, &Default::default())
         .unwrap();
 
-    // Adding a second block will produce a 3-node tree (one parent and two leafs).
+    // Adding a second block will produce a 3-node tree (one parent and two leaves).
     assert_eq!(tree.size(), 3);
     // The tree must have been pruned, resulting in a single peak (the parent).
     assert_eq!(tree.peaks().len(), 1);
@@ -107,7 +106,6 @@ fn push_and_prune_for_network_upgrade(
 /// Test the history tree works during a network upgrade using the block
 /// of a network upgrade and the previous block from the previous upgrade.
 #[test]
-#[ignore] // [ACTIVATION HEIGHT PROBLEM]
 fn upgrade() -> Result<()> {
     // The history tree only exists Hearwood-onward, and the only upgrade for which
     // we have vectors since then is Canopy. Therefore, only test the Heartwood->Canopy upgrade.

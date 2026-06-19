@@ -66,12 +66,6 @@ impl ZcashSerialize for Header {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
         check_version(self.version).map_err(io::Error::other)?;
 
-        let logical_version = if self.version & 0xffff_0000 != 0 {
-            self.version.reverse_bits()
-        } else {
-            self.version
-        };
-
         writer.write_u32::<LittleEndian>(self.version)?;
         self.previous_block_hash.zcash_serialize(&mut writer)?;
         writer.write_all(&self.merkle_root.0[..])?;
@@ -85,12 +79,6 @@ impl ZcashSerialize for Header {
         writer.write_u32::<LittleEndian>(self.difficulty_threshold.0)?;
         writer.write_all(&self.nonce[..])?;
         self.solution.zcash_serialize(&mut writer)?;
-        if logical_version >= 5 {
-            self.fat_pointer_to_bft_block.zcash_serialize(&mut writer)?;
-        }
-        // if logical_version >= 6 {
-        //     writer.write_all(&self.temp_command_buf.data)?;
-        // }
         Ok(())
     }
 }

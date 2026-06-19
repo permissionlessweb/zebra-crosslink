@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::{
     fmt::HexDebug,
     parameters::Network,
-    serialization::{TrustedPreallocate, MAX_PROTOCOL_MESSAGE_LEN},
+    serialization::{TrustedPreallocate, MAX_HEADERS_PER_MESSAGE},
     work::{difficulty::CompactDifficulty, equihash::Solution},
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -110,6 +110,73 @@ pub struct Header {
     pub fat_pointer_to_bft_block: FatPointerToBftBlock,
     // A command string used during development.
     // pub temp_command_buf: CommandBuf2,
+}
+
+/// TODO: Use this error as the source for zebra_consensus::error::BlockError::Time,
+/// and make `BlockError::Time` add additional context.
+/// See <https://github.com/ZcashFoundation/zebra/issues/1021> for more details.
+#[allow(missing_docs)]
+#[derive(Error, Debug)]
+pub enum BlockTimeError {
+    #[error("invalid time {0:?} in block header {1:?} {2:?}: block time is more than 2 hours in the future ({3:?}). Hint: check your machine's date, time, and time zone.")]
+    InvalidBlockTime(
+        DateTime<Utc>,
+        crate::block::Height,
+        crate::block::Hash,
+        DateTime<Utc>,
+    ),
+}
+
+impl Header {
+    /// TODO: Inline this function into zebra_consensus::block::check::time_is_valid_at.
+    /// See <https://github.com/ZcashFoundation/zebra/issues/1021> for more details.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn time_is_valid_at(
+        &self,
+        now: DateTime<Utc>,
+        height: &Height,
+        hash: &Hash,
+    ) -> Result<(), BlockTimeError> {
+        let two_hours_in_the_future = now
+            .checked_add_signed(Duration::hours(2))
+            .expect("calculating 2 hours in the future does not overflow");
+        if self.time <= two_hours_in_the_future {
+            Ok(())
+        } else {
+            Err(BlockTimeError::InvalidBlockTime(
+                self.time,
+                *height,
+                *hash,
+                two_hours_in_the_future,
+            ))?
+        }
+    }
+
+    /// Get the parsed block [`Commitment`] for this header.
+    /// Its interpretation depends on the given `network` and block `height`.
+    pub fn commitment(
+        &self,
+        network: &Network,
+        height: Height,
+    ) -> Result<Commitment, CommitmentError> {
+        Commitment::from_bytes(*self.commitment_bytes, network, height)
+    }
+
+    /// Compute the hash of this header.
+    pub fn hash(&self) -> Hash {
+        Hash::from(self)
+    }
+}
+
+/// A header with a count of the number of transactions in its block.
+/// This structure is used in the Bitcoin network protocol.
+///
+/// The transaction count field is always zero, so we don't store it in the struct.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
+pub struct CountedHeader {
+    /// The header for a block
+    pub header: Arc<Header>,
 }
 
 /// A bundle of signed votes for a block
@@ -263,87 +330,6 @@ impl crate::serialization::ZcashDeserialize for FatPointerToBftBlock {
     }
 }
 
-/// TODO: Use this error as the source for zebra_consensus::error::BlockError::Time,
-/// and make `BlockError::Time` add additional context.
-/// See <https://github.com/ZcashFoundation/zebra/issues/1021> for more details.
-#[allow(missing_docs)]
-#[derive(Error, Debug)]
-pub enum BlockTimeError {
-    #[error("invalid time {0:?} in block header {1:?} {2:?}: block time is more than 2 hours in the future ({3:?}). Hint: check your machine's date, time, and time zone.")]
-    InvalidBlockTime(
-        DateTime<Utc>,
-        crate::block::Height,
-        crate::block::Hash,
-        DateTime<Utc>,
-    ),
-}
-
-impl Header {
-    /// TODO: Inline this function into zebra_consensus::block::check::time_is_valid_at.
-    /// See <https://github.com/ZcashFoundation/zebra/issues/1021> for more details.
-    #[allow(clippy::unwrap_in_result)]
-    pub fn time_is_valid_at(
-        &self,
-        now: DateTime<Utc>,
-        height: &Height,
-        hash: &Hash,
-    ) -> Result<(), BlockTimeError> {
-        let two_hours_in_the_future = now
-            .checked_add_signed(Duration::hours(2))
-            .expect("calculating 2 hours in the future does not overflow");
-        if self.time <= two_hours_in_the_future {
-            Ok(())
-        } else {
-            Err(BlockTimeError::InvalidBlockTime(
-                self.time,
-                *height,
-                *hash,
-                two_hours_in_the_future,
-            ))?
-        }
-    }
-
-    /// Get the parsed block [`Commitment`] for this header.
-    /// Its interpretation depends on the given `network` and block `height`.
-    pub fn commitment(
-        &self,
-        network: &Network,
-        height: Height,
-    ) -> Result<Commitment, CommitmentError> {
-        Commitment::from_bytes(*self.commitment_bytes, network, height)
-    }
-
-    /// Compute the hash of this header.
-    pub fn hash(&self) -> Hash {
-        Hash::from(self)
-    }
-}
-
-/// A header with a count of the number of transactions in its block.
-/// This structure is used in the Bitcoin network protocol.
-///
-/// The transaction count field is always zero, so we don't store it in the struct.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-pub struct CountedHeader {
-    /// The header for a block
-    pub header: Arc<Header>,
-}
-
-/// The serialized size of a Zcash block header.
-///
-/// Includes the equihash input, 32-byte nonce, 3-byte equihash length field, and equihash solution.
-const BLOCK_HEADER_LENGTH: usize = crate::work::equihash::Solution::INPUT_LENGTH
-    + 32
-    + 3
-    + crate::work::equihash::SOLUTION_SIZE
-    + (76 - 32 + 2)
-    + 128;
-
-/// The minimum size for a serialized CountedHeader.
-///
-/// A CountedHeader has BLOCK_HEADER_LENGTH bytes + 1 or more bytes for the transaction count
-pub(crate) const MIN_COUNTED_HEADER_LEN: usize = BLOCK_HEADER_LENGTH + 1;
 
 /// The Zcash accepted block version.
 ///
@@ -352,9 +338,14 @@ pub(crate) const MIN_COUNTED_HEADER_LEN: usize = BLOCK_HEADER_LENGTH + 1;
 pub const ZCASH_BLOCK_VERSION: u32 = 4;
 
 impl TrustedPreallocate for CountedHeader {
+    /// Cap `CountedHeader` preallocation at the existing protocol-level
+    /// constant `MAX_HEADERS_PER_MESSAGE = 160`. The previous return value was
+    /// derived from `MAX_PROTOCOL_MESSAGE_LEN`, allowing peer-controlled
+    /// preallocation amplification — same shape as GHSA-xr93-pcq3-pxf8 for
+    /// `AddrV1`/`AddrV2` (PR #10494).
     fn max_allocation() -> u64 {
-        // Every vector type requires a length field of at least one byte for de/serialization.
-        // Therefore, we can never receive more than (MAX_PROTOCOL_MESSAGE_LEN - 1) / MIN_COUNTED_HEADER_LEN counted headers in a single message
-        ((MAX_PROTOCOL_MESSAGE_LEN - 1) / MIN_COUNTED_HEADER_LEN) as u64
+        // Cast safe: MAX_HEADERS_PER_MESSAGE is the constant 160, which fits
+        // trivially in u64 on every platform.
+        MAX_HEADERS_PER_MESSAGE as u64
     }
 }

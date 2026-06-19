@@ -8,8 +8,8 @@ use serde_big_array::BigArray;
 use crate::{
     block::Header,
     serialization::{
-        zcash_serialize_bytes, SerializationError, ZcashDeserialize, ZcashDeserializeInto,
-        ZcashSerialize,
+        zcash_deserialize_bytes_external_count, zcash_serialize_bytes, CompactSizeMessage,
+        SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
     },
 };
 
@@ -176,7 +176,7 @@ impl Solution {
                 }
 
                 if Self::difficulty_is_valid(&header) {
-                    valid_solutions.push(header.clone());
+                    valid_solutions.push(header);
                 }
             }
 
@@ -262,7 +262,19 @@ impl ZcashSerialize for Solution {
 
 impl ZcashDeserialize for Solution {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let solution: Vec<u8> = (&mut reader).zcash_deserialize_into()?;
+        let len: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+        let len: usize = len.into();
+
+        // Validate the length against the consensus-required sizes before
+        // allocating, so an attacker-controlled CompactSize cannot force a
+        // multi-megabyte allocation.
+        if len > SOLUTION_SIZE {
+            return Err(SerializationError::Parse(
+                "incorrect equihash solution size",
+            ));
+        }
+
+        let solution = zcash_deserialize_bytes_external_count(len, &mut reader)?;
         Self::from_bytes(&solution)
     }
 }

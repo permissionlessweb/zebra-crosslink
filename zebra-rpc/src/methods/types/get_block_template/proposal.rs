@@ -7,7 +7,7 @@ use std::{num::ParseIntError, str::FromStr, sync::Arc};
 use zebra_chain::{
     block::{self, Block, Height},
     parameters::{Network, NetworkUpgrade},
-    serialization::{DateTime32, SerializationError, ZcashDeserializeInto},
+    serialization::{BytesInDisplayOrder, DateTime32, SerializationError, ZcashDeserializeInto},
     work::equihash::Solution,
 };
 use zebra_node_services::BoxError;
@@ -212,9 +212,11 @@ pub fn proposal_block_from_template(
 
     let commitment_bytes = match NetworkUpgrade::current(net, height) {
         NetworkUpgrade::Canopy => chain_history_root.bytes_in_serialized_order(),
-        NetworkUpgrade::Nu5 | NetworkUpgrade::Nu6 | NetworkUpgrade::Nu6_1 | NetworkUpgrade::Nu7 => {
-            block_commitments_hash.bytes_in_serialized_order()
-        }
+        NetworkUpgrade::Nu5
+        | NetworkUpgrade::Nu6
+        | NetworkUpgrade::Nu6_1
+        | NetworkUpgrade::Nu6_2
+        | NetworkUpgrade::Nu7 => block_commitments_hash.bytes_in_serialized_order(),
         _ => Err(SerializationError::Parse(
             "Zebra does not support generating pre-Canopy block templates",
         ))?,

@@ -38,7 +38,9 @@ use zebra_chain::{
 };
 use zebra_consensus::{error::TransactionError, transaction};
 use zebra_network::{self as zn, PeerSocketAddr};
-use zebra_node_services::mempool::{Gossip, MempoolChange, MempoolTxSubscriber, Request, Response};
+use zebra_node_services::mempool::{
+    CreatedOrSpent, Gossip, MempoolChange, MempoolTxSubscriber, Request, Response,
+};
 use zebra_state as zs;
 use zebra_state::{ChainTipChange, TipAction};
 
@@ -566,16 +568,15 @@ impl Service<Request> for Mempool {
             // Re-verify the transactions that were pending or valid at the previous tip.
             // This saves us the time and data needed to re-download them.
             if let ActiveState::Enabled { tx_downloads, .. } = &mut self.active_state {
-                // Note(Sam): This was very loud.
-                // info!(
-                //     transactions = tx_retries.len(),
-                //     "re-verifying mempool transactions after a chain fork"
-                // );
+                info!(
+                    transactions = tx_retries.len(),
+                    "re-verifying mempool transactions after a chain fork"
+                );
 
                 for tx in tx_retries {
                     // This is just an efficiency optimisation, so we don't care if queueing
                     // transaction requests fails.
-                    let _result = tx_downloads.download_if_needed_and_verify(tx, None);
+                    let _result = tx_downloads.download_if_needed_and_verify(tx, None, None);
                 }
             }
 
@@ -633,11 +634,15 @@ impl Service<Request> for Mempool {
                             tracing::trace!("chain grew during tx verification, retrying ..",);
 
                             // We don't care if re-queueing the transaction request fails.
-                            let _result = tx_downloads
-                                .download_if_needed_and_verify(tx.transaction.into(), rsp_tx);
+                            let _result = tx_downloads.download_if_needed_and_verify(
+                                tx.transaction.into(),
+                                None,
+                                rsp_tx,
+                            );
                         }
                     }
-                    Ok(Err((tx_id, error))) => {
+                    Ok(Err(boxed_err)) => {
+                        let (tx_id, error) = *boxed_err;
                         if let TransactionDownloadVerifyError::Invalid {
                             error,
                             advertiser_addr: Some(advertiser_addr),
@@ -658,13 +663,13 @@ impl Service<Request> for Mempool {
                         invalidated_ids.insert(tx_id);
                         storage.reject_if_needed(tx_id, error);
                     }
-                    Err(_elapsed) => {
-                        // A timeout happens when the stream hangs waiting for another service,
-                        // so there is no specific transaction ID.
+                    Err((tx_id, _elapsed)) => {
+                        tracing::info!(
+                            ?tx_id,
+                            "mempool transaction failed to verify due to timeout"
+                        );
 
-                        // TODO: Return the transaction id that timed out during verification so it can be
-                        //       included in the list of invalidated transactions and change `warn!` to `info!`.
-                        tracing::warn!("mempool transaction failed to verify due to timeout");
+                        invalidated_ids.insert(tx_id);
 
                         metrics::counter!("mempool.failed.verify.tasks.total", "reason" => "timeout").increment(1);
                     }
@@ -870,8 +875,11 @@ impl Service<Request> for Mempool {
                                 > {
                                     let (rsp_tx, rsp_rx) = oneshot::channel();
                                     storage.should_download_or_verify(gossiped_tx.id())?;
-                                    tx_downloads
-                                        .download_if_needed_and_verify(gossiped_tx, Some(rsp_tx))?;
+                                    tx_downloads.download_if_needed_and_verify(
+                                        gossiped_tx,
+                                        None,
+                                        Some(rsp_tx),
+                                    )?;
 
                                     Ok(rsp_rx)
                                 },
@@ -885,12 +893,100 @@ impl Service<Request> for Mempool {
                     async move { Ok(Response::Queued(rsp)) }.boxed()
                 }
 
+                // Queue inv-advertised candidates from a specific peer.
+                // Per-peer accounting is enforced inside the downloader.
+                Request::QueueFromPeer { txids, source } => {
+                    trace!(req_count = ?txids.len(), ?source, "got mempool QueueFromPeer request");
+
+                    for txid in txids {
+                        if storage.should_download_or_verify(txid).is_err() {
+                            continue;
+                        }
+                        let _ = tx_downloads.download_if_needed_and_verify(
+                            Gossip::Id(txid),
+                            Some(source),
+                            None,
+                        );
+                    }
+
+                    self.update_metrics();
+
+                    async move { Ok(Response::Queued(Vec::new())) }.boxed()
+                }
+
                 // Store successfully downloaded and verified transactions in the mempool
                 Request::CheckForVerifiedTransactions => {
                     trace!(?req, "got mempool request");
 
                     // all the work for this request is done in poll_ready
                     async move { Ok(Response::CheckedForVerifiedTransactions) }.boxed()
+                }
+
+                // Summary statistics for the mempool: count, total size, and memory usage.
+                //
+                // Used by the `getmempoolinfo` RPC method
+                Request::QueueStats => {
+                    trace!(?req, "got mempool request");
+
+                    let size = storage.transaction_count();
+
+                    let bytes = storage.total_serialized_size();
+
+                    let usage = bytes; // TODO: Placeholder, should be fixed later
+
+                    // TODO: Set to Some(true) on regtest once network info is available.
+                    let fully_notified = None;
+
+                    trace!(size, bytes, usage, "answered mempool request");
+
+                    async move {
+                        Ok(Response::QueueStats {
+                            size,
+                            bytes,
+                            usage,
+                            fully_notified,
+                        })
+                    }
+                    .boxed()
+                }
+                Request::UnspentOutput(outpoint) => {
+                    trace!(?req, "got mempool request");
+
+                    if storage.has_spent_outpoint(&outpoint) {
+                        trace!(?req, "answered mempool request");
+
+                        return async move {
+                            Ok(Response::TransparentOutput(Some(CreatedOrSpent::Spent)))
+                        }
+                        .boxed();
+                    }
+
+                    if let Some((tx_version, output)) = storage
+                        .transactions()
+                        .get(&outpoint.hash)
+                        .map(|tx| tx.transaction.transaction.clone())
+                        .and_then(|tx| {
+                            tx.outputs()
+                                .get(outpoint.index as usize)
+                                .map(|output| (tx.version(), output.clone()))
+                        })
+                    {
+                        trace!(?req, "answered mempool request");
+
+                        let last_seen_hash = *last_seen_tip_hash;
+                        return async move {
+                            Ok(Response::TransparentOutput(Some(CreatedOrSpent::Created {
+                                output,
+                                tx_version,
+                                last_seen_hash,
+                            })))
+                        }
+                        .boxed();
+                    }
+
+                    trace!(?req, "answered mempool request");
+
+                    async move { Ok(Response::TransparentOutput(None)) }.boxed()
                 }
             },
             ActiveState::Disabled => {
@@ -908,7 +1004,9 @@ impl Service<Request> for Mempool {
 
                     Request::TransactionsById(_) => Response::Transactions(Default::default()),
                     Request::TransactionsByMinedId(_) => Response::Transactions(Default::default()),
-                    Request::TransactionWithDepsByMinedId(_) | Request::AwaitOutput(_) => {
+                    Request::TransactionWithDepsByMinedId(_)
+                    | Request::AwaitOutput(_)
+                    | Request::UnspentOutput(_) => {
                         return async move {
                             Err("mempool is not active: wait for Zebra to sync to the tip".into())
                         }
@@ -936,12 +1034,23 @@ impl Service<Request> for Mempool {
                             .collect(),
                     ),
 
+                    // Drop peer-advertised txids when the mempool is disabled.
+                    Request::QueueFromPeer { .. } => Response::Queued(Vec::new()),
+
                     // Check if the mempool should be enabled.
                     // This request makes sure mempools are debug-enabled in the acceptance tests.
                     Request::CheckForVerifiedTransactions => {
                         // all the work for this request is done in poll_ready
                         Response::CheckedForVerifiedTransactions
                     }
+
+                    // Return empty mempool stats
+                    Request::QueueStats => Response::QueueStats {
+                        size: 0,
+                        bytes: 0,
+                        usage: 0,
+                        fully_notified: None,
+                    },
                 };
 
                 async move { Ok(resp) }.boxed()
