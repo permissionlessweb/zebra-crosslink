@@ -67,7 +67,7 @@ lazy_static = "1.5.0"
 zebra-test = { path = "../zebra-test", version = "3.0.0" }
 
 [features]
-default = []
+default = ["viz_gui"]
 viz_gui = ["macroquad", "macroquad-profiler", "image", "miniquad"]
 audio = ["macroquad/audio"]
 

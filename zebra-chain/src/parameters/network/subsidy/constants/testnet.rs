@@ -176,11 +176,13 @@ pub(crate) const POST_NU6_FUNDING_STREAMS_NUM_ADDRESSES: usize = 13;
 /// In the spec ([protocol specification §7.10][7.10]) this is defined as: `fs.addressindex(fs.endheight - 1)`
 /// however we know this value beforehand so we prefer to make it a constant instead.
 ///
-/// There are 27 funding stream periods across the 939,500 blocks for which the post-NU6.1 funding streams are
-/// active. See Testnet funding streams in revision 2 of <https://zips.z.cash/zip-0214#funding-streams>.
+/// Address periods for post-NU6.1 Testnet funding streams. Height range
+/// `NU6_1 .. 4_476_000` requires **28** periods with current network
+/// parameters (was 27; under-sized lists panic at zebrad startup).
+/// See <https://zips.z.cash/zip-0214#funding-streams>.
 ///
 /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#fundingstreams
-pub(crate) const POST_NU6_1_FUNDING_STREAMS_NUM_ADDRESSES: usize = 27;
+pub(crate) const POST_NU6_1_FUNDING_STREAMS_NUM_ADDRESSES: usize = 28;
 
 /// List of addresses for the Major Grants post-NU6 funding stream on Testnet administered by the Financial Privacy Fund (FPF).
 pub(crate) const POST_NU6_FUNDING_STREAM_FPF_ADDRESSES: [&str;

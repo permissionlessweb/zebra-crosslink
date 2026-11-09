@@ -173,3 +173,7 @@ zebra-rpc/qa/cache/
 zebra-chain/fuzz/artifacts
 zebra-chain/fuzz/corpus
 
+
+# local demo configs
+*.local.toml
+scripts/data/

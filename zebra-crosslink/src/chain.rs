@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;
 use tracing::error;
-use zebra_chain::block::Header as BcBlockHeader;
+// expose publicly so external apps only need to import zebra-crosslink
+pub use zebra_chain::block::Header as BcBlockHeader;
 
 use zebra_chain::serialization::{
     ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,

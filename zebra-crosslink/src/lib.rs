@@ -128,7 +128,17 @@ pub mod config {
 
 pub mod test_format;
 #[cfg(feature = "viz_gui")]
+pub mod ibc_live;
+#[cfg(feature = "viz_gui")]
+pub mod manifold;
+#[cfg(feature = "viz_gui")]
+pub mod packet_feed;
+#[cfg(feature = "viz_gui")]
+pub mod shaders;
+#[cfg(feature = "viz_gui")]
 pub mod viz;
+#[cfg(feature = "viz_gui")]
+pub mod viz_http;
 
 use crate::service::{TFLServiceCalls, TFLServiceHandle};
 

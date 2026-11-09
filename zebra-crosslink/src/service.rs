@@ -20,6 +20,7 @@ use tracing::{error, info, warn};
 use zebra_chain::block::{Hash as BlockHash, Height as BlockHeight};
 use zebra_chain::transaction::Hash as TxHash;
 use zebra_node_services::mempool::{Request as MempoolRequest, Response as MempoolResponse};
+use zebra_node_services::service_traits::ZebraService;
 use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse};
 
 use crate::chain::BftBlock;
@@ -28,6 +29,8 @@ use crate::{
     rng_private_public_key_from_address, tfl_service_incoming_request, TFLBlockFinality,
     TFLServiceInternal,
 };
+
+
 
 use tower::Service;
 impl Service<TFLServiceRequest> for TFLServiceHandle {

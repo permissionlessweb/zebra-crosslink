@@ -613,6 +613,11 @@ pub async fn service_viz_requests(
         validators_keys_to_names: HashMap::new(),
     });
 
+    // Browser-facing companion (default http://127.0.0.1:18234/).
+    crate::viz_http::spawn_viz_http_server();
+    // Real Terp CometBFT event tail (ICS-4 + light-client) → packet manifold.
+    crate::ibc_live::spawn_terp_event_tailer();
+
     let mut had_bft_string = false;
     loop {
         let old_g = VIZ_G.lock().unwrap().as_ref().unwrap().clone();
@@ -966,6 +971,12 @@ struct Node {
     vel: Vec2,
     acc: Vec2,
     rad: f32,
+
+    // shader fields
+    pulse: f32,
+    last_pulse_time: f32,
+    node_type: String,
+    parent_angle: f32,
 }
 
 fn tfl_nominee_from_node(ctx: &VizCtx, node: &Node) -> NodeRef {
@@ -1097,6 +1108,19 @@ impl Node {
                 Blake3Hash(hash).to_string()
             }
         })
+    }
+}
+
+impl From<&Node> for crate::shaders::RenderNode {
+    fn from(node: &Node) -> Self {
+        Self {
+            pos_x: node.pt.x,
+            pos_y: node.pt.y,
+            pulse: node.pulse,
+            last_pulse_time: node.last_pulse_time,
+            node_type_float: crate::shaders::RenderNode::kind_to_float(&node.node_type),
+            parent_angle: node.parent_angle,
+        }
     }
 }
 
@@ -1331,6 +1355,11 @@ impl VizCtx {
                         pt: Vec2::_0,
                         vel: Vec2::_0,
                         acc: Vec2::_0,
+
+                        pulse: 0.0,
+                        last_pulse_time: 0.0,
+                        node_type: "block".to_string(),
+                        parent_angle: 0.0,
                     },
                     true,
                 )
@@ -1373,6 +1402,11 @@ impl VizCtx {
                         pt: Vec2::_0,
                         vel: Vec2::_0,
                         acc: Vec2::_0,
+
+                        pulse: 0.0,
+                        last_pulse_time: 0.0,
+                        node_type: "block".to_string(),
+                        parent_angle: 0.0,
                     },
                     true,
                 )
@@ -1416,10 +1450,15 @@ impl VizCtx {
 
                         is_real,
 
+                        rad,
                         pt: vec2(100., 0.),
                         vel: Vec2::_0,
                         acc: Vec2::_0,
-                        rad,
+
+                        pulse: 0.0,
+                        last_pulse_time: 0.0,
+                        node_type: "bft".to_string(),
+                        parent_angle: 0.0,
                     },
                     true,
                 )
@@ -1846,7 +1885,7 @@ fn draw_multiline_text(
     line_distance_factor: Option<f32>,
     col: color::Color,
 ) {
-    text::draw_multiline_text(text, pt.x, pt.y, font_size, line_distance_factor, col)
+    let _ = text::draw_multiline_text(text, pt.x, pt.y, font_size, line_distance_factor, col);
 }
 
 fn circles_closest_pts(a: Circle, b: Circle) -> (Vec2, Vec2) {
@@ -2131,6 +2170,9 @@ pub async fn viz_main(
     let mut mouse_dn_node_i: NodeRef = None;
     let mut click_node_i: NodeRef = None;
     let font_size = 32.;
+
+    // Initialize unified GLSL shader renderer (single material, node+edge passes)
+    let graph_shaders = crate::shaders::GraphShaders::new();
 
     let base_style = root_ui()
         .style_builder()
@@ -3381,6 +3423,72 @@ pub async fn viz_main(
 
         // ALT: EoA
         let (mut bc_h_lo, mut bc_h_hi): (Option<u32>, Option<u32>) = (None, None);
+
+        // === Upload node/edge data to GLSL textures ===
+        // Chain graph (PoW / BFT) plus crystalline IBC manifold from live feed.
+        let mut render_nodes: Vec<crate::shaders::RenderNode> =
+            ctx.nodes.iter().map(|n| n.into()).collect();
+
+        let mut edges: Vec<(u32, u32)> = ctx
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, node)| {
+                node.parent.and_then(|parent_hdl| {
+                    let p_idx = parent_hdl.idx;
+                    if p_idx < ctx.nodes.len() as u32 {
+                        Some((p_idx, i as u32))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        let screen_w = window::screen_width();
+        let screen_h = window::screen_height();
+        let now = macroquad::time::get_time() as f32;
+
+        // Bridge real Zebra object tips → packet feed (crosslink header path).
+        {
+            let pow_tip = g
+                .state
+                .bc_tip
+                .map(|(h, _)| h.0 as u64)
+                .or_else(|| {
+                    g.state
+                        .height_hashes
+                        .last()
+                        .map(|(h, _)| h.0 as u64)
+                })
+                .unwrap_or(0);
+            let bft_tip = g.state.bft_blocks.len() as u64;
+            crate::ibc_live::observe_zebra_heights(pow_tip, bft_tip);
+        }
+
+        let base = render_nodes.len() as u32;
+        let (overlay_nodes, overlay_edges) =
+            crate::packet_feed::build_overlay(screen_w, screen_h, now, base);
+        render_nodes.extend(overlay_nodes);
+        edges.extend(overlay_edges);
+        // Cap to shader texture limits.
+        if render_nodes.len() > crate::shaders::MAX_NODES {
+            render_nodes.truncate(crate::shaders::MAX_NODES);
+        }
+        if edges.len() > crate::shaders::MAX_EDGES {
+            edges.truncate(crate::shaders::MAX_EDGES);
+        }
+
+        graph_shaders.update_node_texture(&render_nodes, now, screen_w, screen_h);
+        graph_shaders.update_edge_texture(&edges, edges.len());
+
+        graph_shaders.render(
+            render_nodes.len() as u32,
+            edges.len() as u32,
+            screen_w,
+            screen_h,
+        );
+
         let z_draw_nodes = begin_zone("draw nodes");
         for (i, node) in ctx.nodes.iter().enumerate() {
             // draw nodes that are on-screen
