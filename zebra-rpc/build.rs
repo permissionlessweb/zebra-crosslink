@@ -123,5 +123,7 @@ fn build_rpc_schema() -> Result<(), Box<dyn std::error::Error>> {
     let trait_names = ["Rpc"];
     openrpsee::generate_openrpc(json_rpc_methods_rs, &trait_names, false, &out_dir)?;
 
+    println!("cargo:rustc-cfg=rpc_openrpc");
+    println!("cargo:rustc-check-cfg=cfg(rpc_openrpc)");
     Ok(())
 }

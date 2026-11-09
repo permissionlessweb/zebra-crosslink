@@ -3,7 +3,7 @@
 //! This is the code that starts `zebrad`, and launches its tasks and services.
 //! See [the crate docs](crate) and [the start docs](crate::commands::start) for more details.
 
-use std::{env, fmt::Write as _, io::Write as _, process, sync::Arc};
+use std::{env, fmt::Write as _, io::Write as _, ops::Deref, process, sync::Arc};
 
 use abscissa_core::{
     application::{self, AppCell},
@@ -15,6 +15,10 @@ use abscissa_core::{
 use semver::{BuildMetadata, Version};
 
 use tokio::sync::watch;
+use zebra_chain::{
+    block::Height,
+    parameters::{testnet, Magic},
+};
 use zebra_network::constants::PORT_IN_USE_ERROR;
 use zebra_state::{
     constants::LOCK_FILE_ERROR, state_database_format_version_in_code,
@@ -188,6 +192,10 @@ impl ZebradApp {
     }
 }
 
+/// Override for application config for use by crosslink tests.
+pub static CROSSLINK_TEST_CONFIG_OVERRIDE: std::sync::Mutex<Option<Arc<ZebradConfig>>> =
+    std::sync::Mutex::new(None);
+
 impl Application for ZebradApp {
     /// Entrypoint command for this application.
     type Cmd = EntryPoint;
@@ -200,7 +208,41 @@ impl Application for ZebradApp {
 
     /// Accessor for application configuration.
     fn config(&self) -> Arc<ZebradConfig> {
-        self.config.read()
+        CROSSLINK_TEST_CONFIG_OVERRIDE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| {
+                // NORMAL OPERATION CROSSLINK CONFIG OVERRIDES
+                let mut c = self.config.read().deref().clone();
+                if c.crosslink.do_not_manipulate_config == false {
+                    c.mining.miner_address = None;
+                    c.mining.internal_miner = true;
+                    c.network.network = testnet::Parameters::build()
+                        //.with_network_name("CrosslinkTestnet")
+                        .with_network_magic(Magic([67, 108, 84, 110]))
+                        .unwrap()
+                        .with_slow_start_interval(Height(0))
+                        .to_network().unwrap();
+                    c.network.initial_testnet_peers.clear();
+                    c.network
+                        .initial_testnet_peers
+                        .insert("80.78.31.51:8233".to_owned());
+                    c.network
+                        .initial_testnet_peers
+                        .insert("80.78.31.32:8233".to_owned());
+                    c.mempool.debug_enable_at_height = Some(0);
+                    c.rpc.enable_cookie_auth = false;
+                    c.state
+                        .cache_dir
+                        .push("zebra_crosslink_workshop_october_cache_delete_me");
+
+                    c.crosslink.malachite_peers =
+                        vec!["80.78.31.51:8234".to_owned(), "80.78.31.32:8234".to_owned()];
+                }
+                Arc::new(c)
+            })
     }
 
     /// Borrow the application state immutably.
@@ -570,6 +612,19 @@ pub fn boot(app_cell: &'static AppCell<ZebradApp>) -> ! {
     let args =
         EntryPoint::process_cli_args(env::args_os().collect()).unwrap_or_else(|err| err.exit());
 
+    #[cfg(feature = "viz_gui")]
+    {
+        // TODO: gate behind feature-flag
+        // TODO: only open the visualization window for the `start` command.
+        // i.e.: can we move it to that code without major refactor to make compiler happy?
+        let tokio_root_thread_handle = std::thread::spawn(move || {
+            ZebradApp::run(app_cell, args);
+        });
+
+        zebra_crosslink::viz::main(Some(tokio_root_thread_handle));
+    }
+
+    #[cfg(not(feature = "viz_gui"))]
     ZebradApp::run(app_cell, args);
     process::exit(0);
 }

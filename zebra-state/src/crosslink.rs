@@ -5,6 +5,7 @@ use std::fmt;
 use tokio::sync::broadcast;
 
 use zebra_chain::block::{Hash as BlockHash, Height as BlockHeight};
+use zebra_node_services::service_traits::ZebraService;
 
 /// The finality status of a block
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
@@ -90,3 +91,8 @@ impl fmt::Display for TFLServiceError {
 
 use std::error::Error;
 impl Error for TFLServiceError {}
+
+/// Trait alias for services handling read-only state requests.
+pub trait TflService: ZebraService<TFLServiceRequest, TFLServiceResponse> {}
+
+impl<T> TflService for T where T: ZebraService<TFLServiceRequest, TFLServiceResponse> {}

@@ -34,6 +34,7 @@ use std::{fmt, sync::Arc};
 use proptest_derive::Arbitrary;
 
 use hex::{FromHex, ToHex};
+use schemars::JsonSchema;
 
 use crate::serialization::{
     BytesInDisplayOrder, ReadZcashExt, SerializationError, WriteZcashExt, ZcashDeserialize,
@@ -57,7 +58,16 @@ use super::{txid::TxIdBuilder, AuthDigest, Transaction};
 /// [ZIP-244]: https://zips.z.cash/zip-0244
 /// [Spec: Transaction Identifiers]: https://zips.z.cash/protocol/protocol.pdf#txnidentifiers
 #[derive(
-    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Deserialize, serde::Serialize,
+    Copy,
+    Clone,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    serde::Deserialize,
+    serde::Serialize,
+    JsonSchema,
 )]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct Hash(pub [u8; 32]);

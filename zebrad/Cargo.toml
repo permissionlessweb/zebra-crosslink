@@ -147,6 +147,10 @@ tx_v6 = ["zebra-chain/tx_v6", "zebra-state/tx_v6", "zebra-consensus/tx_v6", "zeb
 # details. This should be only used for testing.
 comparison-interpreter = ["zebra-script/comparison-interpreter"]
 
+# GPU visualizer (macroquad). Boots the crosslink viz window on the main thread
+# while zebrad runs on a worker thread. Requires a local OpenGL 3.3+ stack.
+viz_gui = ["zebra-crosslink/viz_gui"]
+
 [dependencies]
 zebra-chain = { path = "../zebra-chain", version = "10.0.0" }
 zebra-consensus = { path = "../zebra-consensus", version = "9.0.0" }
@@ -158,6 +162,7 @@ zebra-state = { path = "../zebra-state", version = "9.0.0" }
 # "comparison-interpreter" feature. (Feature unification will take care of
 # enabling it in the other imports of zcash-script.)
 zebra-script = { path = "../zebra-script", version = "9.0.0" }
+zebra-crosslink = { path = "../zebra-crosslink" }
 zcash_script = { workspace = true }
 
 # Required for crates.io publishing, but it's only used in tests

@@ -60,7 +60,7 @@ use tracing::Instrument;
 use zcash_address::{unified::Encoding, TryFromAddress};
 use zcash_protocol::consensus::{self, Parameters};
 use zebra_chain::{
-    amount::{Amount, NegativeAllowed},
+    amount::{Amount, NegativeAllowed, NonNegative},
     block::{self, Block, Commitment, Height, SerializedBlock, TryIntoHeight},
     chain_sync_status::ChainSyncStatus,
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
@@ -87,6 +87,7 @@ use zebra_consensus::{
 use zebra_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
 use zebra_node_services::mempool::{self, CreatedOrSpent, MempoolService};
 use zebra_state::{
+    crosslink::{TFLBlockFinality, TFLServiceRequest, TFLServiceResponse, TflService},
     AnyTx, HashOrHeight, OutputLocation, ReadRequest, ReadResponse, ReadState as ReadStateService,
     State as StateService, TransactionLocation,
 };
@@ -107,7 +108,7 @@ use crate::{
 
 pub(crate) mod hex_data;
 pub(crate) mod trees;
-pub(crate) mod types;
+pub mod types;
 
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
@@ -136,6 +137,7 @@ use types::{
     z_validate_address::ZValidateAddressResponse,
 };
 
+#[cfg(rpc_openrpc)]
 include!(concat!(env!("OUT_DIR"), "/rpc_openrpc.rs"));
 
 // TODO: Review the parameter descriptions below, and update them as needed:
@@ -169,6 +171,8 @@ pub(super) const PARAM_VERBOSITY_DESC: &str = "Whether to include verbose output
 pub(super) const PARAM_N_DESC: &str = "The output index in the transaction.";
 pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
     "Whether to include mempool transactions in the response.";
+pub(super) const PARAM_HASH_DESC: &str = "The block hash to query.";
+pub(super) const PARAM_STRING_DESC: &str = "The command string to execute.";
 
 #[cfg(test)]
 mod tests;
@@ -333,7 +337,9 @@ pub trait Rpc {
 
     /// Get the fat pointer to the BFT Chain tip. TODO: Example
     #[method(name = "get_tfl_fat_pointer_to_bft_chain_tip")]
-    async fn get_tfl_fat_pointer_to_bft_chain_tip(&self) -> Option<FatPointerToBftBlock>;
+    async fn get_tfl_fat_pointer_to_bft_chain_tip(
+        &self,
+    ) -> Option<zebra_chain::block::FatPointerToBftBlock>;
 
     /// Get BFT command buffer
     #[method(name = "staking_command")]
@@ -466,7 +472,7 @@ pub trait Rpc {
     /// ```
     /// *(The `address:port` matches the value in `zebrad.toml > [rpc] > listen_addr`)*
     #[method(name = "stream_tfl_new_final_block_hash")]
-    async fn stream_tfl_new_final_block_hash(&self);
+    async fn stream_tfl_new_final_block_hash(&self) -> Result<()>;
 
     /// Placeholder function for streaming new final transaction changes (for testing).
     /// (JSON-RPC pub-sub not implemented, as that will be obviated my move to gRPC).
@@ -483,7 +489,7 @@ pub trait Rpc {
     /// ```
     /// *(The `address:port` matches the value in `zebrad.toml > [rpc] > listen_addr`)*
     #[method(name = "stream_tfl_new_final_txs")]
-    async fn stream_tfl_new_final_txs(&self);
+    async fn stream_tfl_new_final_txs(&self) -> Result<()>;
 
     /// Placeholder function for blocking until a particular block becomes final.
     ///
@@ -1018,8 +1024,17 @@ pub trait Rpc {
 
 /// RPC method implementations.
 #[derive(Clone)]
-pub struct RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
-where
+pub struct RpcImpl<
+    Mempool,
+    TFLService,
+    State,
+    ReadState,
+    Tip,
+    AddressBook,
+    BlockVerifierRouter,
+    SyncStatus,
+> where
+    TFLService: TflService,
     Mempool: MempoolService,
     State: StateService,
     ReadState: ReadStateService,
@@ -1048,6 +1063,8 @@ where
     /// A handle to the mempool service.
     mempool: Mempool,
 
+    tfl_service: TFLService,
+
     /// A handle to the state service.
     state: State,
 
@@ -1075,10 +1092,21 @@ where
 /// A type alias for the last event logged by the server.
 pub type LoggedLastEvent = watch::Receiver<Option<(String, tracing::Level, chrono::DateTime<Utc>)>>;
 
-impl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus> fmt::Debug
-    for RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
+impl<Mempool, TFLService, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
+    fmt::Debug
+    for RpcImpl<
+        Mempool,
+        TFLService,
+        State,
+        ReadState,
+        Tip,
+        AddressBook,
+        BlockVerifierRouter,
+        SyncStatus,
+    >
 where
     Mempool: MempoolService,
+    TFLService: TflService,
     State: StateService,
     ReadState: ReadStateService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
@@ -1098,10 +1126,20 @@ where
     }
 }
 
-impl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
-    RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
+impl<Mempool, TFLService, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
+    RpcImpl<
+        Mempool,
+        TFLService,
+        State,
+        ReadState,
+        Tip,
+        AddressBook,
+        BlockVerifierRouter,
+        SyncStatus,
+    >
 where
     Mempool: MempoolService,
+    TFLService: TflService,
     State: StateService,
     ReadState: ReadStateService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
@@ -1121,6 +1159,7 @@ where
         build_version: VersionString,
         user_agent: UserAgentString,
         mempool: Mempool,
+        tfl_service: TFLService,
         state: State,
         read_state: ReadState,
         block_verifier_router: BlockVerifierRouter,
@@ -1158,6 +1197,7 @@ where
             network: network.clone(),
             debug_force_finished_sync,
             mempool: mempool.clone(),
+            tfl_service,
             state: state.clone(),
             read_state: read_state.clone(),
             latest_chain_tip: latest_chain_tip.clone(),
@@ -1184,10 +1224,21 @@ where
 }
 
 #[async_trait]
-impl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus> RpcServer
-    for RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
+impl<Mempool, TFLService, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
+    RpcServer
+    for RpcImpl<
+        Mempool,
+        TFLService,
+        State,
+        ReadState,
+        Tip,
+        AddressBook,
+        BlockVerifierRouter,
+        SyncStatus,
+    >
 where
     Mempool: MempoolService,
+    TFLService: TflService,
     State: StateService,
     ReadState: ReadStateService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
@@ -1751,7 +1802,9 @@ where
         }
     }
 
-    async fn get_tfl_fat_pointer_to_bft_chain_tip(&self) -> Option<FatPointerToBftBlock> {
+    async fn get_tfl_fat_pointer_to_bft_chain_tip(
+        &self,
+    ) -> Option<zebra_chain::block::FatPointerToBftBlock> {
         let ret = self
             .tfl_service
             .clone()
@@ -1932,7 +1985,7 @@ where
         });
     }
 
-    async fn stream_tfl_new_final_block_hash(&self) {
+    async fn stream_tfl_new_final_block_hash(&self) -> Result<()> {
         use rand::RngCore;
         // TODO: subscribe to TFL notifs
         // ALT: transfer ownership of channel to TFL
@@ -1958,6 +2011,8 @@ where
         } else {
             tracing::error!(?rx, "Bad tfl service return.");
         };
+
+        Ok(())
     }
 
     async fn notify_tfl_block_becomes_final_by_hash(
@@ -1999,7 +2054,7 @@ where
         }
     }
 
-    async fn stream_tfl_new_final_txs(&self) {
+    async fn stream_tfl_new_final_txs(&self) -> Result<()> {
         use rand::RngCore;
         // TODO: subscribe to TFL notifs
         // ALT: transfer ownership of channel to TFL
@@ -2046,6 +2101,8 @@ where
         } else {
             tracing::error!(?rx, "Bad tfl service return.");
         };
+
+        Ok(())
     }
 
     async fn notify_tfl_tx_becomes_final_by_hash(
@@ -3118,6 +3175,11 @@ where
                     let precomputed_coinbase = (next_height == precomputed_height)
                         .then_some(precomputed_coinbase);
 
+                    let fat_pointer = self
+                        .get_tfl_fat_pointer_to_bft_chain_tip()
+                        .await
+                        .expect("get fat pointer should never fail only return a null pointer");
+
                     // Respond instantly with an empty block upon a chain tip change so that
                     // the miner doesn't waste their effort trying to extend a shorter
                     // chain.
@@ -3129,7 +3191,7 @@ where
                         server_long_poll_id,
                         vec![],
                         submit_old,
-                        fa
+                        fat_pointer
                     )
                     .into())
                 }
@@ -4758,14 +4820,19 @@ impl Default for BlockHeaderObject {
     }
 }
 
+/// Hex-encoded hash of a specific transaction.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct GetTxHash(transaction::Hash);
+
 /// Response to a `getbestblockhash` and `getblockhash` RPC request.
 ///
 /// Contains the hex-encoded hash of the requested block.
 ///
 /// Also see the notes for the [`RpcServer::get_best_block_hash`] and `get_block_hash` methods.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, JsonSchema)]
 #[serde(transparent)]
-pub struct GetBlockHashResponse(#[serde(with = "hex")] pub(crate) block::Hash);
+pub struct GetBlockHashResponse(block::Hash);
 
 impl GetBlockHashResponse {
     /// Constructs a new [`GetBlockHashResponse`] from a block hash.
@@ -5370,6 +5437,11 @@ pub enum AddNodeCommand {
     #[serde(rename = "add")]
     Add,
 }
+
+#[derive(Clone, serde::Serialize)]
+pub struct TFLStakerZec(#[serde(with = "hex")] [u8; 32], Zec<NonNegative>);
+#[derive(Clone, serde::Serialize)]
+pub struct TFLStakerZats(#[serde(with = "hex")] [u8; 32], u64);
 
 /// Response to a `gettxout` RPC request.
 ///

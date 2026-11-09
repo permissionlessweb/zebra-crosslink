@@ -86,6 +86,9 @@ pub struct ZebradConfig {
     /// See the Zebra Book for details and examples:
     /// <https://zebra.zfnd.org/user/health.html>
     pub health: crate::components::health::Config,
+
+    /// CrossLink configuration
+    pub crosslink: zebra_crosslink::config::Config,
 }
 
 impl ZebradConfig {
